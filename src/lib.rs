@@ -1,219 +1,105 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
-use std::{
-    fs::File,
-    path::Path,
-    sync::{Arc, RwLock},
-};
-use thiserror::Error;
+/*
+- 6 bytes for a page number (48 bits)
+- Max size is thus 2^60, or 1 EiB (1024*1024 TiB)
+- 47 sub-blocks are thus needed - the last one can never be filled because we
+  pre-alloc the first 128 kiB for the root page. Also because who the heck puts
+  that much storage at the behest of a single machine???
+ */
 
-use memmap2::{MmapMut, MmapOptions, MmapRaw, RemapOptions};
+const NUM_ALLOCS: usize = 47;
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::{self, Write},
+    io::Read,
+    ops::{Deref, DerefMut},
+    path::Path,
+    sync::{mpsc, Arc, Mutex, RwLock},
+};
+
+use memmap2::{MmapMut, MmapOptions, MmapRaw};
 
 pub mod block;
 pub mod block_owned;
+mod error;
+pub mod storage;
+
+pub use error::AllocError;
+use storage::StorageInner;
+
+/// The maximum allocation size
+pub const BLOCK_SIZE: usize = 1 << 20;
 
 /// The minimum database size
 pub const MIN_DB_SIZE: usize = 4 << 20;
 
 /// The size of a root page in the backing file
-pub const ROOT_SIZE: usize = 1 << 16;
+pub const ROOT_SIZE: usize = 1 << 14;
 
 /// The size of all root pages in the backing file
-pub const ROOT_MAP_SIZE: usize = (1 << 16) * 2;
+pub const ROOT_MAP_SIZE: usize = ROOT_SIZE * 2;
 
-struct StorageInner {
-    maps: Vec<MmapRaw>,
-    file: Option<File>,
-}
-
-enum ExpandStorage {
-    ReplaceLastMap(&'static mut [u8]),
-    NewMap(&'static mut [u8]),
-}
-
-impl StorageInner {
-    pub fn init(map: MmapRaw, file: Option<File>) -> Self {
-        Self {
-            maps: vec![map],
-            file,
-        }
-    }
-
-    /// Extract raw slices pointing to the the memory maps with unbounded
-    /// lifetimes.
-    ///
-    /// # Safety
-    ///
-    /// The caller MUST ensure the returned references don't outlive the memory
-    /// maps. This can be done by ensuring all of these references are dropped
-    /// before the backing memory map is, and ensuring that the caller never
-    /// presents it as a 'static to anything that doesn't uphold the same
-    /// condition.
-    pub unsafe fn get_maps(&self) -> Vec<&'static [u8]> {
-        self.maps
-            .iter()
-            .map(|m| {
-                let len = m.len();
-                let ptr = m.as_ptr();
-                std::slice::from_raw_parts(ptr, len)
-            })
-            .collect()
-    }
-
-    /// Expand the backing storage, either by expanding the file and then memory
-    /// mapping it if this is file-backed, or by creating a new anonymous memory
-    /// map if there is no backing file.
-    pub unsafe fn expand(&mut self, new_alloc: usize) -> Result<ExpandStorage, AllocError> {
-        if let Some(file) = self.file.as_ref() {
-            // Resize the file first
-            let current_size = file.metadata().map_err(AllocError::Open)?.len();
-            file.set_len(new_alloc as u64 + current_size).map_err(|e| {
-                AllocError::ResizeFailed {
-                    size: current_size as usize,
-                    requested: current_size as usize + new_alloc,
-                    source: e,
-                }
-            })?;
-            // Update the metadata in order to get the new file size stored
-            file.sync_all().map_err(AllocError::Sync)?;
-
-            // On Linux, we might be able to just expand the last memory map
-            #[cfg(target_os = "linux")]
-            {
-                let map = self.maps.last_mut().unwrap_unchecked();
-                let new_size = map.len() + new_alloc;
-                if map
-                    .remap(new_size, RemapOptions::new().may_move(false))
-                    .is_ok()
-                {
-                    let slice = std::slice::from_raw_parts_mut(map.as_mut_ptr(), map.len());
-                    return Ok(ExpandStorage::ReplaceLastMap(slice));
-                }
-            }
-
-            let map = MmapOptions::new()
-                .offset(current_size)
-                .len(new_alloc)
-                .map_raw(file)
-                .map_err(|e| AllocError::AllocFailed {
-                    requested: new_alloc,
-                    source: e,
-                })?;
-            let ret = std::slice::from_raw_parts_mut(map.as_mut_ptr(), new_alloc);
-            self.maps.push(map);
-            Ok(ExpandStorage::NewMap(ret))
-        } else {
-            // On Linux, we might be able to just expand the last memory map
-            #[cfg(target_os = "linux")]
-            {
-                let map = self.maps.last_mut().unwrap_unchecked();
-                let new_size = map.len() + new_alloc;
-                if map
-                    .remap(new_size, RemapOptions::new().may_move(false))
-                    .is_ok()
-                {
-                    let slice = std::slice::from_raw_parts_mut(map.as_mut_ptr(), map.len());
-                    return Ok(ExpandStorage::ReplaceLastMap(slice));
-                }
-            }
-
-            let map = MmapRaw::from(MmapMut::map_anon(new_alloc).map_err(|e| {
-                AllocError::AllocFailed {
-                    requested: new_alloc,
-                    source: e,
-                }
-            })?);
-            let ret = std::slice::from_raw_parts_mut(map.as_mut_ptr(), new_alloc);
-            self.maps.push(map);
-            Ok(ExpandStorage::NewMap(ret))
-        }
-    }
-
-    pub fn hole_punch(&mut self, _hole: BlockRange) -> Result<(), AllocError> {
-        todo!()
-    }
-
-    /// Flush all memory maps
-    #[cfg(not(windows))]
-    pub fn flush(&self) -> Result<(), AllocError> {
-        if self.file.is_none() {
-            return Ok(());
-        }
-        for map in self.maps.iter() {
-            map.flush().map_err(AllocError::Sync)?;
-        }
-        Ok(())
-    }
-
-    /// Flush all memory maps
-    #[cfg(windows)]
-    pub fn flush(&self) -> Result<(), AllocError> {
-        if self.file.is_none() {
-            return Ok(());
-        }
-        // On Windows, the way we actually flush maps to disk is by flushing
-        // every map with an async call, then synchronizing on the file handle
-        // itself. Thus, we only need to call the synchronous flush on the final
-        // map.
-        let (last, rest) = self.maps.split_last().unwrap_unchecked();
-        for map in rest.iter() {
-            map.flush_async().map_err(AllocError::Sync)?;
-        }
-        last.flush().map_err(AllocError::Sync)?;
-        Ok(())
-    }
-}
-
-struct Reader {
-    /// Raw maps to the backing store. This should be first so that it's always
-    /// dropped before the actual backing store is.
+/// Struct for pulling memory right off of a memory map
+#[derive(Clone)]
+struct RawMemory {
     maps: Vec<&'static [u8]>,
-    /// The backing store we can read from.
-    inner: Arc<RwLock<StorageInner>>,
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct BlockRange {
     start: usize,
     len: usize,
 }
 
-impl Reader {
-    unsafe fn get(&mut self, range: BlockRange) -> Result<&[u8], AllocError> {
-        // Check maps first
+impl RawMemory {
+    unsafe fn get_mut_slice(
+        &self,
+        range: BlockRange,
+    ) -> Result<Option<&'static mut [u8]>, AllocError> {
         let mut start = 0;
         for map in self.maps.iter() {
             let end = start + map.len();
             if range.start < end {
                 let lower = range.start - start;
                 let upper = range.start - start + range.len;
-                return map.get(lower..upper).ok_or(AllocError::InvalidAccess {
+                let m = map.get(lower..upper).ok_or(AllocError::InvalidAccess {
                     offset: range.start,
                     len: range.len,
-                });
+                })?;
+                let len = m.len();
+                let ptr = m.as_ptr() as *mut u8;
+                return Ok(Some(std::slice::from_raw_parts_mut(ptr, len)));
             }
             start = end;
         }
+        Ok(None)
+    }
+
+    /// Get a block of memory from the memory maps. Fails if the requested range is outside the
+    /// memory map range, it is split across memory maps, or the backing memory map tracker was
+    /// poisoned by a separate thread.
+    pub unsafe fn get(
+        &mut self,
+        core: &Arc<DbCore>,
+        range: BlockRange,
+    ) -> Result<&'static mut [u8], AllocError> {
+        // Check maps first
+        if let Some(s) = self.get_mut_slice(range)? {
+            return Ok(s);
+        }
 
         // We ran out of maps, check the inner storage to see if we since got more
-        let Ok(inner) = self.inner.read() else {
-            return Err(AllocError::Other("Backing memory's RwLock was poisoned"));
+        let Ok(inner) = core.storage.lock() else {
+            return Err(AllocError::Other("Backing memory's Mutex was poisoned"));
         };
         self.maps = inner.get_maps();
 
         // Recheck maps
-        let mut start = 0;
-        for map in self.maps.iter() {
-            let end = start + map.len();
-            if range.start < end {
-                let lower = range.start - start;
-                let upper = range.start - start + range.len;
-                return map.get(lower..upper).ok_or(AllocError::InvalidAccess {
-                    offset: range.start,
-                    len: range.len,
-                });
-            }
-            start = end;
+        if let Some(s) = self.get_mut_slice(range)? {
+            return Ok(s);
         }
 
         // At this point, give up. We should never actually hit this unless
@@ -226,64 +112,627 @@ impl Reader {
     }
 }
 
-impl Clone for Reader {
-    fn clone(&self) -> Self {
-        // Make sure we clone the backing store before the maps
-        let inner = self.inner.clone();
-        let maps = self.maps.clone();
-        Self { inner, maps }
+/// Tracking of the actual state of a page that's in the "free" table
+enum FreePageState {
+    /// Page is already allocated and cannot be used.
+    Allocated,
+    /// Page will be free after the oldest reader has moved past the given transaction ID.
+    FreeAfter(u64),
+}
+
+struct IdTracker {
+    /// The newest ID that's been written out
+    newest: u64,
+    /// The oldest ID that's being used somewhere
+    oldest: u64,
+    /// Track which IDs are currently checked out
+    tracker: Vec<(u64, usize)>,
+}
+
+impl IdTracker {
+    pub fn new(id: u64) -> Self {
+        Self {
+            newest: id,
+            oldest: id,
+            tracker: Vec::new(),
+        }
+    }
+
+    fn find_id(&self, id: u64) -> Option<usize> {
+        self.tracker.iter().position(|(list_id, _)| *list_id == id)
+    }
+
+    pub fn newest_id(&self) -> u64 {
+        self.newest
+    }
+
+    pub fn oldest_id(&self) -> u64 {
+        self.oldest
+    }
+
+    pub fn set_newest(&mut self, newest: u64) {
+        self.newest = newest;
+    }
+
+    /// Check a reader out at the current newest ID
+    pub fn checkout(&mut self) -> u64 {
+        // Record that we're checking out at a given ID
+        if let Some(pos) = self.find_id(self.newest) {
+            let tracker: &mut (u64, usize) = &mut self.tracker[pos];
+            if tracker.0 == self.newest {
+                tracker.1 += 1;
+            } else {
+                self.tracker.push((self.newest, 1));
+            }
+        } else {
+            self.tracker.push((self.newest, 1));
+        }
+        self.newest
+    }
+
+    /// Check a reader back in
+    pub fn checkin(&mut self, id: u64) {
+        // Locate the checkout ID in the list
+        let Some(pos) = self.find_id(id) else {
+            panic!("Tried to check in an ID that was never checked out");
+        };
+        // Decrement the checkout ID, and if we drop an ID from the list, it's up to us to increment
+        // the oldest ID known
+        self.tracker[pos].1 -= 1;
+        if self.tracker[pos].1 == 0 {
+            self.tracker.swap_remove(pos);
+            self.oldest = self
+                .tracker
+                .iter()
+                .fold(self.newest, |acc, (id, _)| acc.min(*id));
+        }
     }
 }
 
-pub struct ReadUnit {
-    storage: Reader,
+struct PageReadTracker {
+    read: BTreeMap<u64, usize>,
+    write: BTreeMap<u64, usize>,
+    done: BTreeSet<u64>,
 }
 
-pub struct ReadTxn {}
+impl PageReadTracker {
+    /// Register a page for long term read checkout
+    pub fn checkout(&mut self, page: u64) {
+        if let Some(cnt) = self.write.get_mut(&page) {
+            *cnt += 1;
+        } else if let Some(cnt) = self.read.get_mut(&page) {
+            *cnt += 1;
+        } else if self.done.remove(&page) {
+            self.write.insert(page, 1);
+        } else {
+            self.read.insert(page, 1);
+        }
+    }
 
-pub struct WriteTxn {}
+    /// Check a page back in after concluding the long-term read
+    pub fn checkin(&mut self, page: u64) {
+        if let Some(cnt) = self.read.get_mut(&page) {
+            *cnt -= 1;
+            if *cnt == 0 {
+                self.read.remove(&page);
+            }
+        } else if let Some(cnt) = self.write.get_mut(&page) {
+            *cnt -= 1;
+            if *cnt == 0 {
+                self.write.remove(&page);
+                self.done.insert(page);
+            }
+        } else {
+            panic!("Read page checkin failed: the page to be checked in wasn't in either checkout list");
+        }
+    }
 
-pub struct WriteUnit {}
+    /// Update the writer's list of checked-out pages
+    pub fn update_writer(&mut self, map: &mut BTreeSet<u64>) {
+        for (page, cnt) in self.read.iter() {
+            map.insert(*page);
+            self.write.insert(*page, *cnt);
+        }
+        self.read.clear();
+        for page in self.done.iter() {
+            map.remove(page);
+        }
+        self.done.clear();
+    }
+}
 
-pub struct CommitUnit {}
+/// The Root data that we track and use to synchronize between readers, the writer, and the committer.
+struct RootData {
+    /// ID tracking
+    id_tracker: IdTracker,
+    /// The remaining root data from the most recent writer
+    root: Vec<u8>,
+    /// The freelist page
+    freelist: u64,
+    /// The loaded file type
+    file_type: [u8; 8],
+}
+
+// What are our actual synchronization points:
+//
+// Everyone needs the backing storage, otherwise the maps could be released!
+//
+// | Object     | ID Tracker | Root Data | Read Tracker | WriteFree| Storage |
+// | ---------- | ---------- | --------- | ------------ | -------- | ------- |
+// | ReadUnit   | X          | X         | X            |          | X       |
+// | Readers    | X          |           | X            |          | X       |
+// | ReadBlock  |            |           | X            |          | X       |
+// | WriteUnit  | X          | X         | X            | X        | X       |
+// | WriteAlloc |            |           |              | X        | X       |
+// | CommitUnit | X          | X         |              |          | X       |
+
+struct DbCore {
+    root: Mutex<RootData>,
+    read_pages: Mutex<PageReadTracker>,
+    storage: Mutex<StorageInner>,
+}
+
+struct RootCheckout {
+    id: u64,
+    root: Vec<u8>,
+    freelist: u64,
+}
+
+#[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
+#[repr(C)]
+struct RootHeader {
+    file_type: [u8; 8],
+    len: u16,
+    version: u8,
+    _reserved0: u8,
+    _reserved1: u32,
+    id: u64,
+    freelist: u64,
+}
+
+impl RootData {
+    /// Create a brand new root data structure
+    pub fn new(file_type: &[u8; 8], freelist: u64) -> Self {
+        Self {
+            file_type: file_type.to_owned(),
+            id_tracker: IdTracker::new(0),
+            root: Vec::new(),
+            freelist,
+        }
+    }
+
+    /// Select the newest committed root transaction
+    pub fn newest(self, other: RootData) -> Self {
+        if other.id_tracker.oldest > self.id_tracker.oldest {
+            other
+        } else {
+            self
+        }
+    }
+
+    pub fn load(root: &[u8; 4096]) -> Result<Self, AllocError> {
+        let (header, rem) = root.split_at(std::mem::size_of::<RootHeader>());
+        let header: &RootHeader = bytemuck::from_bytes(header);
+        if header.version != 1 {
+            return Err(AllocError::Open(std::io::Error::other(
+                "Unrecognized version number in header",
+            )));
+        }
+        let len = header.len as usize;
+        let Some(root_data) = rem.get(0..len) else {
+            return Err(AllocError::Open(std::io::Error::other(
+                "Invalid length of header data",
+            )));
+        };
+        let Some(hash) = rem.get(len..(len + 8)) else {
+            return Err(AllocError::Open(std::io::Error::other(
+                "xxHash missing from end of header data",
+            )));
+        };
+        let hash = u64::from_le_bytes(hash.try_into().unwrap());
+
+        let Some(data_for_hash) = root.get(0..(std::mem::size_of::<RootHeader>() + len)) else {
+            return Err(AllocError::Open(std::io::Error::other(
+                "Couldn't grab data to perform xxHash",
+            )));
+        };
+
+        let nominal_hash = xxhash_rust::xxh3::xxh3_64(data_for_hash);
+
+        if nominal_hash != hash {
+            return Err(AllocError::Open(std::io::Error::other(
+                "Invalid xxHash of header data",
+            )));
+        }
+
+        Ok(Self {
+            file_type: header.file_type,
+            id_tracker: IdTracker::new(header.id),
+            root: root_data.to_vec(),
+            freelist: header.freelist,
+        })
+    }
+
+    pub fn store(&self, dst: &mut Vec<u8>) -> Result<(), AllocError> {
+        let len = u16::try_from(self.root.len()).map_err(|_| {
+            AllocError::Other("Tried to write out root page data that's at least 64kiB long")
+        })?;
+        let header = RootHeader {
+            file_type: self.file_type,
+            len,
+            version: 1,
+            _reserved0: 0,
+            _reserved1: 0,
+            id: self.id_tracker.newest,
+            freelist: self.freelist,
+        };
+
+        dst.clear();
+        dst.extend_from_slice(bytemuck::bytes_of(&header));
+        dst.extend_from_slice(&self.root);
+        let hash = xxhash_rust::xxh3::xxh3_64(&dst);
+        dst.extend_from_slice(hash.to_le_bytes().as_slice());
+        Ok(())
+    }
+
+    /// Check out for a reader
+    pub fn checkout(&mut self) -> RootCheckout {
+        let id = self.id_tracker.checkout();
+        RootCheckout {
+            freelist: self.freelist,
+            id,
+            root: self.root.clone(),
+        }
+    }
+
+    /// Check in for a reader
+    pub fn checkin(&mut self, co: &RootCheckout) {
+        self.id_tracker.checkin(co.id);
+    }
+
+    /// Update from a writer
+    pub fn update(&mut self, update: &RootCheckout) {
+        self.root.clear();
+        self.root.extend_from_slice(&update.root);
+        self.id_tracker.set_newest(update.id);
+        self.freelist = update.freelist;
+    }
+}
+
+/// A unit for spawning read transactions
+pub struct ReadUnit {
+    storage: RawMemory,
+    core: Arc<DbCore>,
+}
+
+impl ReadUnit {
+    /// Spawn a read transaction
+    pub fn reader(&self) -> ReadTxn {
+        let core = self.core.clone();
+        ReadTxn {
+            storage: self.storage.clone(),
+            core,
+            root: self.core.root.lock().unwrap().checkout(),
+        }
+    }
+}
+
+impl Clone for ReadUnit {
+    fn clone(&self) -> Self {
+        let core = self.core.clone();
+        Self {
+            storage: self.storage.clone(),
+            core,
+        }
+    }
+}
+
+/// An active read transaction. Prevents the allocator from reusing any pages that have been freed
+/// since the start of this transaction.
+pub struct ReadTxn {
+    storage: RawMemory,
+    core: Arc<DbCore>,
+    root: RootCheckout,
+}
+
+impl Drop for ReadTxn {
+    fn drop(&mut self) {
+        self.core.root.lock().unwrap().checkin(&self.root);
+    }
+}
+
+impl ReadTxn {
+    /// Read an arbitrary point of memory in the memory map.
+    unsafe fn read(&mut self, range: BlockRange) -> Result<&'static [u8], AllocError> {
+        self.storage
+            .get(&self.core, range)
+            .map(|x: &'static mut [u8]| x as &'static [u8])
+    }
+
+    /// Check out a point in memory for long-term reads.
+    ///
+    /// This doesn't check to make sure the range is page-aligned - this must be upheld by the
+    /// caller. The page range must also be a region that was previously allocated.
+    unsafe fn get_block(&mut self, range: BlockRange) -> Result<ReadBlock, AllocError> {
+        let mem = self
+            .storage
+            .get(&self.core, range)
+            .map(|x: &'static mut [u8]| x as &'static [u8])?;
+        Ok(ReadBlock {
+            mem,
+            page: range.start as u64,
+            core: self.core.clone(),
+        })
+    }
+}
+
+struct ReadBlock {
+    mem: &'static [u8],
+    page: u64,
+    core: Arc<DbCore>,
+}
+
+impl Drop for ReadBlock {
+    fn drop(&mut self) {
+        self.core.read_pages.lock().unwrap().checkin(self.page);
+    }
+}
+
+impl Deref for ReadBlock {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.mem
+    }
+}
+
+impl AsRef<[u8]> for ReadBlock {
+    fn as_ref(&self) -> &[u8] {
+        self.mem
+    }
+}
+
+impl fmt::Debug for ReadBlock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadBlock")
+            .field("page", &self.page)
+            .field("size", &self.mem.len())
+            .finish()
+    }
+}
+
+/// A long-term allocated block of memory that hasn't yet been committed to the database.
+///
+/// Write Allocations enable multithreaded bulk writes. Many can be set up at once with [`WriteTxn::write_alloc`]
+pub struct WriteAlloc {
+    mem: &'static mut [u8],
+    page: u64,
+    chan: mpsc::Sender<u64>,
+    core: Arc<DbCore>,
+}
+
+impl WriteAlloc {
+    /// Get the page number that was allocated.
+    fn page(&self) -> u64 {
+        self.page
+    }
+}
+
+impl Drop for WriteAlloc {
+    /// Release the allocated page back to the allocator when dropped
+    fn drop(&mut self) {
+        let _ = self.chan.send(self.page);
+    }
+}
+
+impl Deref for WriteAlloc {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.mem
+    }
+}
+
+impl DerefMut for WriteAlloc {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.mem
+    }
+}
+
+impl AsRef<[u8]> for WriteAlloc {
+    fn as_ref(&self) -> &[u8] {
+        self.mem
+    }
+}
+
+impl AsMut<[u8]> for WriteAlloc {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.mem
+    }
+}
+
+pub struct WriteUnitInner {
+    /// Track which pages in the free list are not actually free
+    taken: BTreeSet<u64>,
+    /// Handle to our central synchronization primitive
+    core: Arc<DbCore>,
+    /// Root data (only used by the Write Transaction)
+    root: RootCheckout,
+    /// Track which pages are marked as dirty
+    dirty: BTreeSet<u64>,
+    /// Secondary "taken" tracker for use during transactions
+    taken_txn: BTreeSet<u64>,
+    /// List of available 4kiB page clusters (with 4-bit tracking info in LSBs)
+    available_4k: Vec<u64>,
+    /// List of allocations that were requested
+    alloc_req: Vec<WriteAlloc>,
+    /// List of allocations that will hopefully be committed
+    alloc_completions: Vec<WriteAlloc>,
+    /// Sender to hand out to the write allocators (indicating when things become free)
+    alloc_send: mpsc::Sender<u64>,
+    /// Receiver to pick up when a write allocation is dropped
+    alloc_recv: mpsc::Receiver<u64>,
+    /// Sender to punch holes in the filesystem when freeing up a block
+    hole_punch_req: mpsc::Sender<u64>,
+    /// Receiver of completed hole punching operations
+    hole_punch_resp: mpsc::Receiver<u64>,
+    /// List of hole punch requests we'll send out on committing a transaction
+    hole_punch_future_req: Vec<u64>,
+}
+
+pub struct WriteUnit(WriteUnitInner);
+pub struct WriteTxn(WriteUnitInner);
+
+impl WriteUnit {
+    pub fn write(mut self) -> WriteTxn {
+        // Process any pending operations from readers, write allocations, and the committer
+        while let Ok(page) = self.0.hole_punch_resp.try_recv() {
+            self.0.taken.remove(&page);
+        }
+        while let Ok(page) = self.0.alloc_recv.try_recv() {
+            self.0.taken.remove(&page);
+        }
+        let mut read_pages = self.0.core.read_pages.lock().unwrap();
+        read_pages.update_writer(&mut self.0.taken);
+        drop(read_pages);
+
+        // Clear out all the transaction working data before starting a new transaction
+        self.0.dirty.clear();
+        self.0.taken_txn.clear();
+        self.0.available_4k.clear();
+        self.0.alloc_req.clear();
+        self.0.alloc_completions.clear();
+        self.0.hole_punch_future_req.clear();
+
+        WriteTxn(self.0)
+    }
+}
+
+/// Allocation information
+struct Alloc {
+    /// The byte offset to the page
+    pub page: u64,
+    /// The allocated number of bytes (always in increments of 4096)
+    pub len: usize,
+}
+
+impl WriteTxn {
+    /// Allocate a new page
+    pub fn txn_allocate(&mut self, len: u64) -> Result<Alloc, AllocError> {
+        let page = 0;
+        self.0.dirty.insert(page);
+        todo!("Actually write the allocator")
+    }
+
+    /// Allocate a page for writing by any thread at any point in time.
+    ///
+    /// Requested allocations are provided once the current write transaction is committed.
+    ///
+    /// The allocated data is not committed until the [`WriteAlloc`] is returned to an active
+    /// [`WriteTxn`] and [`WriteTxn::commit`] is called.
+    pub fn new_allocation(&mut self, len: u64) -> Result<(), AllocError> {
+        todo!("Actually write the allocator")
+    }
+
+    /// Put a written-out allocation into this transaction
+    pub fn use_allocation(&mut self, alloc: WriteAlloc) {
+        self.0.alloc_completions.push(alloc);
+    }
+
+    /// Determine if the provided page is marked as dirty or not
+    pub fn is_dirty(&self, page: u64) -> bool {
+        self.0.dirty.contains(&page)
+    }
+
+    /// Commit the transaction to the database and optionally return the requested long-term allocations.
+    pub fn commit(mut self, root_data: &[u8]) -> (WriteUnit, Vec<WriteAlloc>) {
+        todo!("Push the remaining 4k page allocations into the allocator");
+        todo!("Commit the requested allocations into the taken marker");
+        todo!("Commit the completed allocations");
+        todo!("Update the transaction ID number and the new freelist base page");
+        // 
+        // Hole punch requests
+        for page in self.0.hole_punch_future_req.iter().copied() {
+            let _ = self.0.hole_punch_req.send(page);
+            self.0.taken.insert(page);
+        }
+        todo!()
+    }
+
+    /// Abort the current transaction, undoing all transaction operations and returning any written-out allocation.
+    pub fn abort(mut self) -> (WriteUnit, Vec<WriteAlloc>) {
+        self.0.dirty.clear();
+        self.0.alloc_req.clear();
+        let ret = std::mem::take(&mut self.0.alloc_completions);
+        (WriteUnit(self.0), ret)
+    }
+}
+
+/// Handles committing completed write transactions to disk.
+///
+/// This unit is basically another open read transaction, representing any future program that will
+/// open the database. When it commits to disk, it grabs the current completed transaction, flushes
+/// everything to disk synchronously and advances to that completed transaction ID.
+///
+/// For anonymous memory maps, no sync to disk occurs, but this does still need to be called.
+///
+/// Committing after every write transaction is generally a good idea, though this should be done in
+/// a separate thread, as this is a blocking operation.
+pub struct CommitUnit {
+    /// The current "checked-out" ID we're holding onto
+    id: u64,
+    /// The data to commit to the root page
+    commit_data: Vec<u8>,
+    /// Any pending hole punch operations
+    hole_punch_req: mpsc::Receiver<u64>,
+    /// Completed hole punch operations
+    hole_punch_resp: mpsc::Sender<u64>,
+    /// The two root pages to write to
+    root_write: &'static mut [u8],
+    root_stable: &'static mut [u8],
+    /// Access to the core database synchronization primitives
+    core: Arc<DbCore>,
+}
+
+impl CommitUnit {
+    pub fn commit(&mut self) -> Result<(), AllocError> {
+        // Acquire our next transaction ID now, as we're about to commit everything up to this
+        // point. We also need to grab the current state of the Root that we want to write out.
+        let new_id = {
+            let mut mutex = self.core.root.lock().unwrap();
+            mutex.store(&mut self.commit_data)?;
+            let new_id = mutex.id_tracker.checkout();
+            drop(mutex);
+            new_id
+        };
+
+        // Update the tree root
+        let Some(root_write) = self.root_write.get_mut(0..self.commit_data.len()) else {
+            self.core.root.lock().unwrap().id_tracker.checkin(new_id);
+            return Err(AllocError::Other(
+                "Tried to write root data that was too large for the root page",
+            ));
+        };
+        root_write.copy_from_slice(&self.commit_data);
+
+        // Perform the flush
+        let res = self.core.storage.lock().unwrap().flush();
+
+        if res.is_err() {
+            // We failed to sync, so we need to undo our new checkout and retain the old one.
+            // This probably isn't recoverable, but just in case, we should act as correctly as possible.
+            self.core.root.lock().unwrap().id_tracker.checkin(new_id);
+            return res;
+        }
+
+        // Swap in the new read transaction id
+        self.core.root.lock().unwrap().id_tracker.checkin(self.id);
+        self.id = new_id;
+        Ok(())
+    }
+}
 
 type AllocTuple = (ReadUnit, WriteUnit, CommitUnit);
-
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum AllocError {
-    /// Couldn't open the backing file
-    #[error("Opening the backing file failed")]
-    Open(#[source] std::io::Error),
-    /// Couldn't lock the backing file
-    #[error("Failed to lock the backing file for exclusive use")]
-    Lock(#[source] std::io::Error),
-    /// Couldn't synchronize to the backing file
-    #[error("Synchronizing to the backing file failed")]
-    Sync(#[source] std::io::Error),
-    /// Couldn't resize the backing file
-    #[error(
-        "Can't resize the backing file. Have 0x{size:x} bytes, wanted to get 0x{requested:x} bytes"
-    )]
-    ResizeFailed {
-        size: usize,
-        requested: usize,
-        source: std::io::Error,
-    },
-    /// Couldn't allocate any more space
-    #[error("Can't allocate any more memory map space. Tried to get 0x{requested:x} bytes")]
-    AllocFailed {
-        requested: usize,
-        source: std::io::Error,
-    },
-    #[error("Punching a hole in the sparse memory map failed")]
-    HolePunch(#[source] std::io::Error),
-    /// Other, miscellaneous errors
-    #[error("Other: {0}")]
-    Other(&'static str),
-    #[error("Invalid access on the memory map was attempted. Tried to get slice at offset 0x{offset:x} with length 0x{len:x}")]
-    InvalidAccess { offset: usize, len: usize },
-}
 
 #[derive(Default, Clone, Debug)]
 struct OpenOptions {
@@ -313,13 +762,14 @@ impl OpenOptions {
     }
 
     pub fn open<P: AsRef<Path>>(&self, path: P) -> Result<AllocTuple, AllocError> {
-        use fs4::FileExt;
+        use fs4::fs_std::FileExt;
 
         // Open and lock the file
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)
             .map_err(AllocError::Open)?;
         file.try_lock_exclusive().map_err(AllocError::Lock)?;

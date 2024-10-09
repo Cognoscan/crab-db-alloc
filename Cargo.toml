@@ -8,5 +8,8 @@ edition = "2021"
 [dependencies]
 memmap2 = "0.9"
 thiserror = "1"
-fs4 = "0.8"
+fs4 = "0.10"
 page_size = "0.6"
+byteorder = "1"
+bytemuck = { version = "1", features = ["derive"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
