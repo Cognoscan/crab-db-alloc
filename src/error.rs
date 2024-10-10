@@ -6,6 +6,9 @@ pub enum AllocError {
     /// Couldn't open the backing file
     #[error("Opening the backing file failed")]
     Open(#[source] std::io::Error),
+    /// Couldn't parse the backing file
+    #[error("Error inside the DB format")]
+    DataFormat(#[source] FormatError),
     /// Couldn't lock the backing file
     #[error("Failed to lock the backing file for exclusive use")]
     Lock(#[source] std::io::Error),
@@ -34,6 +37,21 @@ pub enum AllocError {
     Other(&'static str),
     #[error("Invalid access on the memory map was attempted. Tried to get slice at offset 0x{offset:x} with length 0x{len:x}")]
     InvalidAccess { offset: usize, len: usize },
-    #[error("Data integrity hash failed for data at offset 0x{offset:x} with length {len}")]
-    HashFailed { offset: usize, len: usize }
+}
+
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum FormatError {
+    #[error("Root pages have duplicate transaction IDs")]
+    DuplicateIds,
+    #[error("No root data page has a valid hash")]
+    RootHash,
+    #[error("File size is incorrect - too small or not a valid number of 1 MiB blocks")]
+    FileSize,
+    #[error("Invalid page type {0}")]
+    PageType(u8),
+    #[error("Invalid Leaf Page")]
+    LeafPage,
+    #[error("Invalid Branch Page")]
+    BranchPage,
 }

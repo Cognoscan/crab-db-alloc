@@ -12,32 +12,35 @@
 const NUM_ALLOCS: usize = 47;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt::{self, Write},
-    io::Read,
-    ops::{Deref, DerefMut},
-    path::Path,
-    sync::{mpsc, Arc, Mutex, RwLock},
+    cmp::Ordering, collections::{BTreeMap, BTreeSet}, fmt::{self}, ops::{Deref, DerefMut}, path::Path, sync::{mpsc, Arc, Mutex}
 };
 
+use error::FormatError;
 use memmap2::{MmapMut, MmapOptions, MmapRaw};
 
 pub mod block;
 pub mod block_owned;
+pub mod page;
 mod error;
 pub mod storage;
 
 pub use error::AllocError;
 use storage::StorageInner;
 
-/// The maximum allocation size
+/// The maximum allocation size - 1 MiB
 pub const BLOCK_SIZE: usize = 1 << 20;
 
 /// The minimum database size
 pub const MIN_DB_SIZE: usize = 4 << 20;
 
+/// A single page - should always be 4 kiB
+pub const PAGE_SIZE: usize = 1 << 12;
+
+/// A single page cluster - should be 16 kiB
+pub const CLUSTER_SIZE: usize = 4 * PAGE_SIZE;
+
 /// The size of a root page in the backing file
-pub const ROOT_SIZE: usize = 1 << 14;
+pub const ROOT_SIZE: usize = CLUSTER_SIZE;
 
 /// The size of all root pages in the backing file
 pub const ROOT_MAP_SIZE: usize = ROOT_SIZE * 2;
@@ -50,8 +53,17 @@ struct RawMemory {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct BlockRange {
-    start: usize,
-    len: usize,
+    pub start: usize,
+    pub len: usize,
+}
+
+impl BlockRange {
+    pub fn new(start: usize, len: usize) -> Self {
+        Self {
+            start,
+            len
+        }
+    }
 }
 
 impl RawMemory {
@@ -189,6 +201,7 @@ impl IdTracker {
     }
 }
 
+#[derive(Default, Clone, Debug)]
 struct PageReadTracker {
     read: BTreeMap<u64, usize>,
     write: BTreeMap<u64, usize>,
@@ -241,18 +254,6 @@ impl PageReadTracker {
     }
 }
 
-/// The Root data that we track and use to synchronize between readers, the writer, and the committer.
-struct RootData {
-    /// ID tracking
-    id_tracker: IdTracker,
-    /// The remaining root data from the most recent writer
-    root: Vec<u8>,
-    /// The freelist page
-    freelist: u64,
-    /// The loaded file type
-    file_type: [u8; 8],
-}
-
 // What are our actual synchronization points:
 //
 // Everyone needs the backing storage, otherwise the maps could be released!
@@ -286,31 +287,39 @@ struct RootHeader {
     version: u8,
     _reserved0: u8,
     _reserved1: u32,
+    file_len: u64,
     id: u64,
     freelist: u64,
 }
 
+/// The Root data that we track and use to synchronize between readers, the writer, and the committer.
+struct RootData {
+    /// ID tracking
+    id_tracker: IdTracker,
+    /// The remaining root data from the most recent writer
+    root: Vec<u8>,
+    /// The freelist page
+    freelist: u64,
+    /// The loaded file type
+    file_type: [u8; 8],
+    /// The stored file size
+    file_len: u64,
+}
+
+
 impl RootData {
     /// Create a brand new root data structure
-    pub fn new(file_type: &[u8; 8], freelist: u64) -> Self {
+    pub fn new(file_type: &[u8; 8], freelist: u64, file_len: u64) -> Self {
         Self {
             file_type: file_type.to_owned(),
             id_tracker: IdTracker::new(0),
             root: Vec::new(),
             freelist,
+            file_len,
         }
     }
 
-    /// Select the newest committed root transaction
-    pub fn newest(self, other: RootData) -> Self {
-        if other.id_tracker.oldest > self.id_tracker.oldest {
-            other
-        } else {
-            self
-        }
-    }
-
-    pub fn load(root: &[u8; 4096]) -> Result<Self, AllocError> {
+    pub fn load(root: &[u8]) -> Result<Self, AllocError> {
         let (header, rem) = root.split_at(std::mem::size_of::<RootHeader>());
         let header: &RootHeader = bytemuck::from_bytes(header);
         if header.version != 1 {
@@ -350,6 +359,7 @@ impl RootData {
             id_tracker: IdTracker::new(header.id),
             root: root_data.to_vec(),
             freelist: header.freelist,
+            file_len: header.file_len,
         })
     }
 
@@ -365,12 +375,13 @@ impl RootData {
             _reserved1: 0,
             id: self.id_tracker.newest,
             freelist: self.freelist,
+            file_len: self.file_len,
         };
 
         dst.clear();
         dst.extend_from_slice(bytemuck::bytes_of(&header));
         dst.extend_from_slice(&self.root);
-        let hash = xxhash_rust::xxh3::xxh3_64(&dst);
+        let hash = xxhash_rust::xxh3::xxh3_64(dst);
         dst.extend_from_slice(hash.to_le_bytes().as_slice());
         Ok(())
     }
@@ -562,8 +573,12 @@ pub struct WriteUnitInner {
     dirty: BTreeSet<u64>,
     /// Secondary "taken" tracker for use during transactions
     taken_txn: BTreeSet<u64>,
-    /// List of available 4kiB page clusters (with 4-bit tracking info in LSBs)
+    /// List of available 4kiB pages
     available_4k: Vec<u64>,
+    /// List of available 16kiB page clusters (with 4-bit tracking info in LSBs)
+    available_16k: Vec<u64>,
+    /// List of available blocks
+    available_blocks: Vec<u64>,
     /// List of allocations that were requested
     alloc_req: Vec<WriteAlloc>,
     /// List of allocations that will hopefully be committed
@@ -600,6 +615,8 @@ impl WriteUnit {
         self.0.dirty.clear();
         self.0.taken_txn.clear();
         self.0.available_4k.clear();
+        self.0.available_16k.clear();
+        self.0.available_blocks.clear();
         self.0.alloc_req.clear();
         self.0.alloc_completions.clear();
         self.0.hole_punch_future_req.clear();
@@ -609,7 +626,7 @@ impl WriteUnit {
 }
 
 /// Allocation information
-struct Alloc {
+pub struct Alloc {
     /// The byte offset to the page
     pub page: u64,
     /// The allocated number of bytes (always in increments of 4096)
@@ -650,7 +667,7 @@ impl WriteTxn {
         todo!("Commit the requested allocations into the taken marker");
         todo!("Commit the completed allocations");
         todo!("Update the transaction ID number and the new freelist base page");
-        // 
+        //
         // Hole punch requests
         for page in self.0.hole_punch_future_req.iter().copied() {
             let _ = self.0.hole_punch_req.send(page);
@@ -660,7 +677,12 @@ impl WriteTxn {
     }
 
     /// Abort the current transaction, undoing all transaction operations and returning any written-out allocation.
+    /// 
+    /// This will panic if this is called on the first transaction on a brand-new database.
     pub fn abort(mut self) -> (WriteUnit, Vec<WriteAlloc>) {
+        if self.0.root.id == 0 {
+            panic!("Can't abort the very first transaction of the database");
+        }
         self.0.dirty.clear();
         self.0.alloc_req.clear();
         let ret = std::mem::take(&mut self.0.alloc_completions);
@@ -688,8 +710,9 @@ pub struct CommitUnit {
     /// Completed hole punch operations
     hole_punch_resp: mpsc::Sender<u64>,
     /// The two root pages to write to
-    root_write: &'static mut [u8],
-    root_stable: &'static mut [u8],
+    root0: &'static mut [u8],
+    root1: &'static mut [u8],
+    write_root0: bool,
     /// Access to the core database synchronization primitives
     core: Arc<DbCore>,
 }
@@ -706,8 +729,23 @@ impl CommitUnit {
             new_id
         };
 
+        // Perform the main flush
+        let res = {
+            let mutex = self.core.storage.lock().unwrap();
+            let res = mutex.flush();
+            drop(mutex);
+            res
+        };
+        if res.is_err() {
+            // We failed to sync, so we need to undo our new checkout and retain the old one.
+            // This probably isn't recoverable, but just in case, we should act as correctly as possible.
+            self.core.root.lock().unwrap().id_tracker.checkin(new_id);
+            return res;
+        }
+
         // Update the tree root
-        let Some(root_write) = self.root_write.get_mut(0..self.commit_data.len()) else {
+        let root_write = if self.write_root0 { &mut self.root0 } else { &mut self.root1 };
+        let Some(root_write) = root_write.get_mut(0..self.commit_data.len()) else {
             self.core.root.lock().unwrap().id_tracker.checkin(new_id);
             return Err(AllocError::Other(
                 "Tried to write root data that was too large for the root page",
@@ -715,9 +753,14 @@ impl CommitUnit {
         };
         root_write.copy_from_slice(&self.commit_data);
 
-        // Perform the flush
-        let res = self.core.storage.lock().unwrap().flush();
-
+        // Flush the tree root
+        let root_block = BlockRange::new(if self.write_root0 { 0 } else { ROOT_SIZE }, ROOT_SIZE);
+        let res = {
+            let mutex = self.core.storage.lock().unwrap();
+            let res = mutex.flush_range(root_block);
+            drop(mutex);
+            res
+        };
         if res.is_err() {
             // We failed to sync, so we need to undo our new checkout and retain the old one.
             // This probably isn't recoverable, but just in case, we should act as correctly as possible.
@@ -734,9 +777,19 @@ impl CommitUnit {
 
 type AllocTuple = (ReadUnit, WriteUnit, CommitUnit);
 
-#[derive(Default, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct OpenOptions {
     size: Option<usize>,
+    file_type: [u8; 8],
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            size: None,
+            file_type: *b"crab-db\0",
+        }
+    }
 }
 
 impl OpenOptions {
@@ -749,6 +802,14 @@ impl OpenOptions {
         self
     }
 
+    /// Set the desired file type header for creating a new database. If one isn't specified, this
+    /// will default to the byte string "crab-db\0".
+    pub fn file_type(&mut self, file_type: &[u8; 8]) -> &mut Self {
+        self.file_type = *file_type;
+        self
+    }
+    
+    /// Open an anonymous memory map isntead of an on-disk file.
     pub fn open_anon(&self) -> Result<AllocTuple, AllocError> {
         let size = self.size.unwrap_or_default().max(MIN_DB_SIZE);
         let map = MmapRaw::from(
@@ -763,6 +824,10 @@ impl OpenOptions {
 
     pub fn open<P: AsRef<Path>>(&self, path: P) -> Result<AllocTuple, AllocError> {
         use fs4::fs_std::FileExt;
+
+        if (page_size::get() != PAGE_SIZE) && (page_size::get() != CLUSTER_SIZE) {
+            return Err(AllocError::Other("System page size is neither 4kiB nor 16kiB."));
+        }
 
         // Open and lock the file
         let file = std::fs::OpenOptions::new()
@@ -782,32 +847,143 @@ impl OpenOptions {
             ));
         }
         let file_size = file_size as usize;
-        let mut size = self.size.unwrap_or_default().max(MIN_DB_SIZE);
-        if size > file_size {
-            file.set_len(size as u64)
+        let is_new = file_size == 0;
+        if (file_size > 0 && file_size < MIN_DB_SIZE) || ((file_size & (BLOCK_SIZE - 1)) != 0) {
+            return Err(AllocError::DataFormat(error::FormatError::FileSize));
+        }
+        let requested_size = (self.size.unwrap_or(MIN_DB_SIZE) & !(BLOCK_SIZE - 1))
+            .max(MIN_DB_SIZE)
+            .max(file_size);
+        if requested_size != file_size {
+            file.set_len(file_size as u64)
                 .map_err(|e| AllocError::ResizeFailed {
                     size: file_size,
-                    requested: size,
+                    requested: requested_size,
                     source: e,
                 })?;
-            size = file_size;
         }
-        let root_map = MmapOptions::new()
-            .len(ROOT_MAP_SIZE)
-            .map_raw(&file)
-            .map_err(|e| AllocError::AllocFailed {
-                requested: ROOT_MAP_SIZE,
-                source: e,
-            })?;
+
         let map = MmapOptions::new()
-            .offset(ROOT_MAP_SIZE as u64)
-            .len(size - ROOT_MAP_SIZE)
+            .len(requested_size)
             .map_raw(&file)
             .map_err(|e| AllocError::AllocFailed {
-                requested: size - ROOT_MAP_SIZE,
+                requested: requested_size,
                 source: e,
             })?;
+        
+
         let storage = StorageInner::init(map, Some(file));
+        let read_storage = RawMemory {
+            maps: unsafe { storage.get_maps() },
+        };
+
+        let commit_root0 = unsafe { read_storage.get_mut_slice(BlockRange::new(0, ROOT_SIZE)).unwrap().unwrap() };
+        let commit_root1 = unsafe { read_storage.get_mut_slice(BlockRange::new(ROOT_SIZE, ROOT_SIZE)).unwrap().unwrap() };
+        let (mut root, commit_write_root0) = if is_new {
+            (RootData::new(&self.file_type, 0, 0), true)
+        } else {
+            let root0 = RootData::load(commit_root0);
+            let root1 = RootData::load(commit_root1);
+            match (root0, root1) {
+                (Err(e0), Err(e1)) => return Err(e0),
+                (Ok(root), Err(_)) => (root, false),
+                (Err(_), Ok(root)) => (root, true),
+                (Ok(root0), Ok(root1)) => {
+                    match root0.id_tracker.newest.cmp(&root1.id_tracker.newest) {
+                        Ordering::Equal => return Err(AllocError::DataFormat(FormatError::DuplicateIds)),
+                        Ordering::Greater => (root0, false),
+                        Ordering::Less => (root1, true),
+                    }
+                }
+            }
+        };
+        let commit_id = root.id_tracker.checkout();
+
+        let write_root_checkout = if is_new {
+            RootCheckout {
+                id: root.id_tracker.newest,
+                root: Vec::new(),
+                freelist: ROOT_MAP_SIZE as u64,
+            }
+        }
+        else {
+            RootCheckout {
+                id: root.id_tracker.newest,
+                root: root.root.clone(),
+                freelist: root.freelist,
+            }
+        };
+
+        let core = Arc::new(DbCore {
+            root: Mutex::new(root),
+            read_pages: Mutex::new(PageReadTracker::default()),
+            storage: Mutex::new(storage),
+        });
+
+        let (alloc_send, alloc_recv) = mpsc::channel();
+        let (write_hole_punch_req, commit_hole_punch_req) = mpsc::channel();
+        let (commit_hole_punch_resp, write_hole_punch_resp) = mpsc::channel();
+
+        let mut write = WriteTxn(WriteUnitInner {
+            taken: BTreeSet::new(),
+            core: core.clone(),
+            root: write_root_checkout,
+            dirty: BTreeSet::new(),
+            taken_txn: BTreeSet::new(),
+            available_4k: Vec::new(),
+            available_16k: Vec::new(),
+            available_blocks: Vec::new(),
+            alloc_req: Vec::new(),
+            alloc_completions: Vec::new(),
+            alloc_send,
+            alloc_recv,
+            hole_punch_req: write_hole_punch_req,
+            hole_punch_resp: write_hole_punch_resp,
+            hole_punch_future_req: Vec::new(),
+        });
+
+        if is_new {
+            // If we're brand new, forcibly set up our freelist and then populate in our initial pages
+            todo!("Set up the freelist");
+            if page_size::get() == PAGE_SIZE {
+                for page in ((ROOT_MAP_SIZE as u64)..(BLOCK_SIZE as u64)).step_by(PAGE_SIZE) {
+                    write.0.available_4k.push(page);
+                }
+            }
+            else {
+                for page in ((ROOT_MAP_SIZE as u64)..(BLOCK_SIZE as u64)).step_by(CLUSTER_SIZE) {
+                    write.0.available_16k.push(page);
+                }
+            }
+            for page in ((BLOCK_SIZE as u64)..(requested_size as u64)).step_by(BLOCK_SIZE) {
+                write.0.available_blocks.push(page);
+            }
+        }
+        else if requested_size != file_size {
+            // If we're not brand new, and our 
+
+        }
+        // If the actual file size
+
+        let read = ReadUnit {
+            storage: read_storage,
+            core: core.clone(),
+        };
+
+        let commit = CommitUnit {
+            id: commit_id,
+            commit_data: Vec::new(),
+            hole_punch_req: commit_hole_punch_req,
+            hole_punch_resp: commit_hole_punch_resp,
+            root0: commit_root0,
+            root1: commit_root1,
+            write_root0: commit_write_root0,
+            core,
+        };
+
+        // Determine if we have
+
+        //let root = RootData::load()
         todo!()
     }
 }

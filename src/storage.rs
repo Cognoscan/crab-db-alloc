@@ -17,6 +17,8 @@ pub(crate) struct StorageInner {
 }
 
 impl StorageInner {
+
+    /// Initialize with a memory map and an optional backing file.
     pub fn init(map: MmapRaw, file: Option<File>) -> Self {
         Self {
             maps: vec![map],
@@ -159,7 +161,7 @@ impl StorageInner {
         Ok(())
     }
 
-    /// Flush all memory maps
+    /// Flush all memory maps.
     #[cfg(not(windows))]
     pub fn flush(&self) -> Result<(), AllocError> {
         if self.file.is_none() {
@@ -171,7 +173,7 @@ impl StorageInner {
         Ok(())
     }
 
-    /// Flush all memory maps
+    /// Flush all memory maps.
     #[cfg(windows)]
     pub fn flush(&self) -> Result<(), AllocError> {
         if self.file.is_none() {
@@ -187,5 +189,33 @@ impl StorageInner {
         }
         last.flush().map_err(AllocError::Sync)?;
         Ok(())
+    }
+
+    /// Flush a range within a single memory map. Errors if the range crosses memory maps.
+    pub fn flush_range(&self, range: BlockRange) -> Result<(), AllocError> {
+        if self.file.is_none() {
+            return Ok(());
+        }
+
+        let mut start = 0;
+        for map in self.maps.iter() {
+            let end = start + map.len();
+            if range.start < end {
+                if (range.start + range.len) > end {
+                    return Err(AllocError::InvalidAccess {
+                        offset: range.start,
+                        len: range.len,
+                    });
+                }
+                map.flush_range(range.start - start, range.len)
+                    .map_err(AllocError::Sync)?;
+                return Ok(());
+            }
+            start = end;
+        }
+        Err(AllocError::InvalidAccess {
+            offset: range.start,
+            len: range.len,
+        })
     }
 }
