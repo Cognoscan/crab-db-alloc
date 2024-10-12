@@ -18,6 +18,7 @@ use std::{
 use error::FormatError;
 use memmap2::{MmapMut, MmapOptions, MmapRaw};
 
+pub mod int_page;
 pub mod block;
 pub mod block_owned;
 pub mod page;
