@@ -1,4 +1,4 @@
-use super::PageError;
+use crate::Error;
 
 /// An array of variable-size key-value pairs that grows upward in memory.
 pub struct KeyValArray {
@@ -38,11 +38,11 @@ impl KeyValArray {
     /// Try to increment the front to the next key-value pair, failing if the
     /// result pushes us past the end pointer. This also returns a pointer to
     /// the value on success.
-    pub fn next_pair(&mut self, key_size: isize, val_size: isize) -> Result<*mut u8, PageError> {
-        let val_ptr = self.front.wrapping_offset(key_size);
-        let new_front = val_ptr.wrapping_offset(val_size);
+    pub fn next_pair(&mut self, key_size: usize, val_size: usize) -> Result<*mut u8, Error> {
+        let val_ptr = self.front.wrapping_add(key_size);
+        let new_front = val_ptr.wrapping_add(val_size);
         if new_front > self.back {
-            return Err(PageError::DataCorruption);
+            return Err(Error::DataCorruption);
         }
         self.front_val = val_ptr;
         self.front = new_front;
@@ -54,14 +54,14 @@ impl KeyValArray {
     /// value on success.
     pub fn next_pair_back(
         &mut self,
-        key_size: isize,
-        val_size: isize,
-    ) -> Result<*mut u8, PageError> {
+        key_size: usize,
+        val_size: usize,
+    ) -> Result<*mut u8, Error> {
         self.prev_back_key = self.back;
-        let val_ptr = self.back.wrapping_offset(-val_size);
-        let new_back = val_ptr.wrapping_offset(-key_size);
+        let val_ptr = self.back.wrapping_sub(val_size);
+        let new_back = val_ptr.wrapping_sub(key_size);
         if new_back < self.front {
-            return Err(PageError::DataCorruption);
+            return Err(Error::DataCorruption);
         }
         self.back_val = val_ptr;
         self.back = new_back;

@@ -46,13 +46,13 @@ impl TwoArrayTrailer {
     /// constructed from these lengths in combination with a pointer to the base
     /// of the page.
     #[inline]
-    pub fn lengths<L,U,const PAGE_SPACE: usize>(&self) -> Result<TwoArrayLengths, PageError> {
+    pub fn lengths<L,U,const PAGE_SPACE: usize>(&self) -> Result<TwoArrayLengths, Error> {
         let ret = TwoArrayLengths {
             upper: self.upper_len.to_le() as isize,
             lower: self.lower_len.to_le() as isize,
         };
         if ret.total::<L,U>() > (PAGE_SPACE as isize) {
-            return Err(PageError::DataCorruption);
+            return Err(Error::DataCorruption);
         }
         Ok(ret)
     }
