@@ -1,4 +1,4 @@
-use std::{fmt, cmp::Ordering, iter::FusedIterator};
+use std::{cmp::Ordering, fmt, iter::FusedIterator};
 
 use thiserror::Error;
 
@@ -105,9 +105,8 @@ impl fmt::Debug for IntPage {
 }
 
 impl IntPage {
-
     /// Initialize a page without checking for correct alignment or 4 kiB size.
-    /// 
+    ///
     /// # Safety
     ///
     /// The page must be aligned to a 4 kiB boundary and 4 kiB in size.
@@ -200,7 +199,6 @@ impl IntPage {
     /// Get a key-value pair from the page
     pub fn get(&self, key: u64) -> Option<u64> {
         for (k, v) in self.iter() {
-            println!("(k,v)=({},{})",k,v);
             match k.cmp(&key) {
                 Ordering::Greater => return None,
                 Ordering::Equal => return Some(v),
@@ -258,7 +256,7 @@ impl IntPage {
     }
 
     /// Remove a key from the page, returning any old value, if one was present.
-    pub fn remove(&mut self, key: u64, val: u64) -> Option<u64> {
+    pub fn remove(&mut self, key: u64) -> Option<u64> {
         match self.entry(key) {
             Entry::Occupied(e) => Some(e.remove()),
             Entry::Vacant(_) => None,
@@ -353,8 +351,7 @@ impl<'a> DoubleEndedIterator for IntPageIter<'a> {
                     return None;
                 }
                 let val_mask = u64::MAX >> val_len;
-                let val = (self.data_end as *const u64).read_unaligned() & val_mask;
-                val
+                (self.data_end as *const u64).read_unaligned() & val_mask
             };
 
             // Move the pointer to the key and extract it
@@ -380,7 +377,6 @@ pub enum Entry<'a> {
 }
 
 impl<'a> Entry<'a> {
-
     /// Get the key for this entry
     pub fn key(&self) -> u64 {
         match self {
@@ -423,13 +419,71 @@ impl<'a> OccupiedEntry<'a> {
     }
 
     /// Try to set the new value for this entry, returning the old one
-    pub fn insert(self, val: u64) -> Result<u64, OutofSpace> {
-        todo!()
+    pub fn insert(mut self, val: u64) -> Result<u64, OutofSpace> {
+        // Calculate the new size
+        let key_len = (self.key.leading_zeros() as u8 >> 3).min(0x7);
+        let val_len = val.leading_zeros() as u8 >> 3;
+        let data_len = 16 - ((key_len + val_len) as usize);
+
+        // Get the old size and check if we have space
+        let old_data_len = unsafe { self.insert_item.offset_from(self.insert_data) };
+        if data_len > (self.page.available() - (old_data_len as usize)) {
+            return Err(OutofSpace);
+        }
+
+        unsafe {
+            // Replace the length number
+            *self.insert_item = (val_len << 3) | key_len;
+
+            // Move the existing data as needed
+            let copy_len = self.page.header().end() as usize - (self.next_data as usize & 0xFFF);
+            self.insert_data
+                .add(data_len)
+                .copy_from(self.next_data, copy_len);
+
+            // Copy in the key
+            let mut new_key = (self.insert_data as *const u64).read_unaligned();
+            new_key &= u64::MAX << ((8 - key_len) << 3);
+            new_key |= self.key;
+            (self.insert_data as *mut u64).write_unaligned(new_key);
+            self.insert_data = self.insert_data.add((8 - key_len) as usize);
+
+            // Copy in the value
+            if val_len < 0x10 {
+                let mut new_val = (self.insert_data as *const u64).read_unaligned();
+                new_val &= u64::MAX << ((8 - val_len) << 3);
+                new_val |= val;
+                (self.insert_data as *mut u64).write_unaligned(new_val);
+            }
+        }
+
+        // Update the end of the data region
+        let end = self.page.header().end() + (data_len as u16) - (old_data_len as u16);
+        self.page.header_mut().set_end(end);
+        Ok(self.val)
     }
 
     /// Remove the entry from the page.
     pub fn delete(self) {
-        todo!()
+        unsafe {
+            // Delete the length entry
+            let last_item = self
+                .page
+                .mem
+                .add(HEADER_OFFSET + 1 - (self.page.header().len() as usize));
+            let copy_len = self.insert_item.offset_from(last_item);
+            last_item.copy_to(last_item.offset(1), copy_len as usize);
+
+            // Move down the remaining data
+            let copy_len = self.page.header().end() as usize - (self.next_data as usize & 0xFFF);
+            self.insert_data.copy_from(self.next_data, copy_len);
+        }
+
+        // Update the length and the end
+        let old_data_len = unsafe { self.next_data.offset_from(self.insert_data) as u16 };
+        let header = self.page.header_mut();
+        header.set_end(header.end() - old_data_len);
+        header.set_len(header.len() - 1);
     }
 
     /// Remove this entry from the page, returning the value
@@ -512,28 +566,33 @@ impl<'a> VacantEntry<'a> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn simple() {
-        let mut mem = [0u8;8192];
-        let ptr = mem.as_mut_ptr().wrapping_add(mem.as_mut_ptr().align_offset(4096));
+        let mut mem = [0u8; 8192];
+        let ptr = mem
+            .as_mut_ptr()
+            .wrapping_add(mem.as_mut_ptr().align_offset(4096));
 
         let mut page = unsafe { IntPage::new(ptr, 0) };
         assert_eq!(page.available(), HEADER_OFFSET);
         assert_eq!(page.get(0), None);
-        assert_eq!(page.insert(0,1), Ok(None));
-        assert_eq!(page.insert(1,2), Ok(None));
-        assert_eq!(page.insert(2,3), Ok(None));
+        assert_eq!(page.insert(0, 1), Ok(None));
+        assert_eq!(page.insert(1, 2), Ok(None));
+        assert_eq!(page.insert(2, 3), Ok(None));
         println!("page = {:x?}", page);
         assert_eq!(page.get(0), Some(1));
         assert_eq!(page.get(1), Some(2));
         assert_eq!(page.get(2), Some(3));
+        println!("remove data");
+        assert_eq!(page.remove(1), Some(2));
+        assert_eq!(page.remove(2), Some(3));
+        assert_eq!(page.remove(0), Some(1));
+        assert_eq!(page.remove(0), None);
 
         println!("{}", mem[4095]);
     }
-
 }

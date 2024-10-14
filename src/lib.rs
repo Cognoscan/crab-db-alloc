@@ -21,7 +21,7 @@ use memmap2::{MmapMut, MmapOptions, MmapRaw};
 pub mod int_page;
 pub mod block;
 pub mod block_owned;
-pub mod page;
+pub mod pages;
 mod error;
 pub mod storage;
 
@@ -663,8 +663,9 @@ impl WriteTxn {
     }
 
     /// Commit the transaction to the database and optionally return the requested long-term allocations.
-    pub fn commit(mut self, root_data: &[u8]) -> (WriteUnit, Vec<WriteAlloc>) {
+    pub fn commit(self, root_data: &[u8]) -> (WriteUnit, Vec<WriteAlloc>) {
         todo!("Push the remaining 4k page allocations into the allocator");
+        /*
         todo!("Commit the requested allocations into the taken marker");
         todo!("Commit the completed allocations");
         todo!("Update the transaction ID number and the new freelist base page");
@@ -675,6 +676,7 @@ impl WriteTxn {
             self.0.taken.insert(page);
         }
         todo!()
+        */
     }
 
     /// Abort the current transaction, undoing all transaction operations and returning any written-out allocation.
@@ -925,7 +927,7 @@ impl OpenOptions {
         let (write_hole_punch_req, commit_hole_punch_req) = mpsc::channel();
         let (commit_hole_punch_resp, write_hole_punch_resp) = mpsc::channel();
 
-        let mut write = WriteTxn(WriteUnitInner {
+        let write = WriteTxn(WriteUnitInner {
             taken: BTreeSet::new(),
             core: core.clone(),
             root: write_root_checkout,
@@ -946,6 +948,7 @@ impl OpenOptions {
         if is_new {
             // If we're brand new, forcibly set up our freelist and then populate in our initial pages
             todo!("Set up the freelist");
+            /*
             if page_size::get() == PAGE_SIZE {
                 for page in ((ROOT_MAP_SIZE as u64)..(BLOCK_SIZE as u64)).step_by(PAGE_SIZE) {
                     write.0.available_4k.push(page);
@@ -959,6 +962,7 @@ impl OpenOptions {
             for page in ((BLOCK_SIZE as u64)..(requested_size as u64)).step_by(BLOCK_SIZE) {
                 write.0.available_blocks.push(page);
             }
+            */
         }
         else if requested_size != file_size {
             // If we're not brand new, and our 
