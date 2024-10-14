@@ -33,19 +33,16 @@ This is another memory-mapped key-value database, in the same vein as
 ## What workloads is it good for?
 
 If your workload primarily has write transactions of a megabyte or more, and
-leans more towards frequent reads than it does frequenty writes, then crab-db
+leans more towards frequent reads than it does frequent writes, then crab-db
 will probably work well for you. It'll work even better if your read/write
-workload sequentially operates over keys. Massive write throughput is possible
-if your system has some idea of the value size ahead of time, and can execute
+workload sequentially operates over keys. High write throughput is possible
+if your system has some idea of the value size ahead of time, your
+high-throughput values are over 4 kiB in size, and can execute
 many large writes in a single transaction.
 
 If your workload is instead many small transactions, or is primarily
 write-oriented (eg. for data logging), consider alternate databases,
 particularly ones that incorporate a log-structured merge tree approach.
-
-With the above said, though, write amplification is pretty hard to avoid with
-modern storage anyway, so finding a way to restructure your workload to have
-larger transaction sizes may be to your advantage regardless.
 
 ## Memory-Mapped
 
