@@ -1,6 +1,7 @@
 use crate::Error;
 
 /// An array of variable-size values that grows upward in memory.
+#[derive(Clone, Debug)]
 pub struct UnsizedArray {
     prev_front: *mut u8,
     front: *mut u8,
@@ -27,6 +28,13 @@ impl UnsizedArray {
             end: back,
             prev_front: front,
             prev_back: back,
+        }
+    }
+
+    /// Get how many bytes are inside this array.
+    pub fn remaining_bytes(&self) -> usize {
+        unsafe {
+            self.back.offset_from(self.front) as usize
         }
     }
 

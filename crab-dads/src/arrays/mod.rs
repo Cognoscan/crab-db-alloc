@@ -1,4 +1,6 @@
-
+/*!
+Unsafe structures for handling arrays of values within a memory region.
+ */
 mod sized_array;
 mod unsized_array;
 mod rev_sized_array;

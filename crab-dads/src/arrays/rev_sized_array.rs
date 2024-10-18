@@ -3,6 +3,7 @@ use std::iter::FusedIterator;
 use bytemuck::AnyBitPattern;
 
 /// An array of fixed-size values that grows downward in memory.
+#[derive(Clone, Debug)]
 pub struct RevSizedArray<T: AnyBitPattern> {
     front: *mut T,
     back: *mut T,

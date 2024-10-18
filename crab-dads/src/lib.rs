@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 mod trailer;
+pub mod pages;
 pub mod arrays;
 pub use trailer::*;
 

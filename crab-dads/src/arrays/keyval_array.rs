@@ -1,6 +1,7 @@
 use crate::Error;
 
 /// An array of variable-size key-value pairs that grows upward in memory.
+#[derive(Clone, Debug)]
 pub struct KeyValArray {
     // These pointers are ordered from lowest memory point to highest.
     prev_front: *mut u8,
@@ -32,6 +33,13 @@ impl KeyValArray {
             prev_front: front,
             prev_back_key: back,
             back_val: back,
+        }
+    }
+
+    /// Get how many bytes are still held inside this array
+    pub fn remaining_bytes(&self) -> usize {
+        unsafe {
+            self.back.offset_from(self.front) as usize
         }
     }
 
@@ -70,9 +78,13 @@ impl KeyValArray {
 
     /// Update the internal pointers to mimic the outcome of getting a `None`
     /// result from calling [`next_pair_back`](#method.next_pair_back) on
-    /// iteration.
-    pub fn next_pair_back_none(&mut self) {
+    /// iteration. This returns an error if our iterator isn't actually exhausted.
+    pub fn next_pair_back_none(&mut self) -> Result<(), Error> {
+        if self.back != self.front {
+            return Err(Error::DataCorruption);
+        }
         self.prev_back_key = self.back;
+        Ok(())
     }
 
     /// Pointer to the key at the front of the array
@@ -125,7 +137,7 @@ impl KeyValArray {
         len
     }
 
-    /// Resize the value that was just read using
+    /// Resize the key-value pair that was just read using
     /// [`next_pair_back`](#method.next_pair_back), returning a pointer to it.
     /// 
     /// # Safety
