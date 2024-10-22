@@ -1,38 +1,83 @@
-use std::iter::FusedIterator;
+use std::{iter::FusedIterator, marker::PhantomData};
 
 use bytemuck::AnyBitPattern;
 
 /// An array of fixed-size values that grows downward in memory.
 #[derive(Clone, Debug)]
-pub struct RevSizedArray<T: AnyBitPattern> {
+pub struct RevSizedArray<'a, T: AnyBitPattern> {
+    front: *const T,
+    back: *const T,
+    data: PhantomData<&'a [T]>
+}
+
+impl<'a, T: AnyBitPattern> RevSizedArray<'a, T> {
+    pub fn new(data: &[T]) -> Self {
+        let range = data.as_ptr_range();
+        Self {
+            front: range.end,
+            back: range.start,
+            data: PhantomData,
+        }
+    }
+}
+
+impl<'a, T: AnyBitPattern> Iterator for RevSizedArray<'a, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        if self.front == self.back {
+            return None;
+        }
+        unsafe {
+            self.front = self.front.sub(1);
+            Some(self.front.read())
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let size = unsafe { self.front.offset_from(self.back) as usize };
+        (size, Some(size))
+    }
+}
+
+impl<'a, T: AnyBitPattern> FusedIterator for RevSizedArray<'a, T> {}
+
+impl<'a, T: AnyBitPattern> ExactSizeIterator for RevSizedArray<'a, T> {}
+
+impl<'a, T: AnyBitPattern> DoubleEndedIterator for RevSizedArray<'a, T> {
+    fn next_back(&mut self) -> Option<T> {
+        if self.front == self.back {
+            return None;
+        }
+        unsafe {
+            let ret = self.back.read();
+            self.back = self.back.add(1);
+            Some(ret)
+        }
+    }
+}
+
+
+/// An array of fixed-size values that grows downward in memory.
+#[derive(Clone, Debug)]
+pub struct RevSizedArrayMut<'a, T: AnyBitPattern> {
     front: *mut T,
     back: *mut T,
     end: *mut T,
     prev_back: *mut T,
+    data: PhantomData<&'a mut [T] >
 }
 
-impl<T: AnyBitPattern> RevSizedArray<T> {
+impl<'a, T: AnyBitPattern> RevSizedArrayMut<'a, T> {
     /// Create a new iterator over a sized array of values that grow downwards,
-    /// given a pointer that is 1 byte past the top of the array.
-    ///
-    /// # Safety
-    ///
-    /// Behavior is defined only if the following conditions are met:
-    ///
-    /// - The `front` pointer must be within the accepted range of a memory
-    ///   allocation.
-    /// - The `front` pointer must point to 1 byte past the end of the array.
-    /// - The `front` pointer must be aligned to the size of `T`.
-    /// - When the length (which must be positive) is subtracted from `end`, the
-    ///   resulting pointer should not go beyond the pointed-to memory.
-    ///
-    pub unsafe fn new(front: *mut T, len: isize) -> Self {
-        let back = front.offset(-len);
+    pub fn new(data: &mut [T]) -> Self {
+        let range = data.as_mut_ptr_range();
         Self {
-            front,
-            back,
-            end: back,
-            prev_back: back,
+            front: range.end,
+            back: range.start,
+            end: range.start,
+            prev_back: range.start,
+            data: PhantomData,
         }
     }
 
@@ -111,33 +156,9 @@ impl<T: AnyBitPattern> RevSizedArray<T> {
         );
         self.prev_back.sub(1).write(val);
     }
-}
 
-impl<T: AnyBitPattern> Iterator for RevSizedArray<T> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<T> {
-        if self.front == self.back {
-            return None;
-        }
-        unsafe {
-            self.front = self.front.sub(1);
-            Some(self.front.read())
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let size = unsafe { self.front.offset_from(self.back) as usize };
-        (size, Some(size))
-    }
-}
-
-impl<T: AnyBitPattern> FusedIterator for RevSizedArray<T> {}
-
-impl<T: AnyBitPattern> ExactSizeIterator for RevSizedArray<T> {}
-
-impl<T: AnyBitPattern> DoubleEndedIterator for RevSizedArray<T> {
-    fn next_back(&mut self) -> Option<T> {
+    /// Get the next item in the array, from the back.
+    pub fn next_back(&mut self) -> Option<T> {
         self.prev_back = self.back;
         if self.front == self.back {
             return None;
