@@ -1,7 +1,9 @@
 use crate::Error;
 
-use super::PageLayout;
+use super::{PageLayout, MAX_VAR_SIZE};
 
+/// Page map layout for U64 keys and variable-length values, including support
+/// for sub-trees and values too large for a page.
 pub struct LayoutU64Var {
     info: u16,
     key_len: usize,
@@ -14,9 +16,6 @@ enum VarTypeList {
     Ref,
     Page,
 }
-
-/// 4 kiB - (8 trailer bytes) - (4 objects) * (8 bytes of other + 2 bytes of layout)
-pub const MAX_VAR_SIZE: usize = 4096 - 8 - (4 * (8 + 2));
 
 pub enum VarTypes<'a> {
     /// A page-local byte slice.
@@ -165,12 +164,12 @@ unsafe impl<'a> PageLayout<'a> for LayoutU64Var {
         self.val_len
     }
 
-    fn read_key(&self, src: &[u8]) -> Result<Self::Key, Error> {
+    unsafe fn read_key(&self, src: &[u8]) -> Result<Self::Key, Error> {
         let key_mask = u64::MAX >> ((self.info & 0x7) << 3);
         unsafe { Ok(key_mask & (src.as_ptr() as *const u64).read_unaligned().to_le()) }
     }
 
-    fn read_value(&self, src: &'a [u8]) -> Result<Self::Value, Error> {
+    unsafe fn read_value(&self, src: &'a [u8]) -> Result<Self::Value, Error> {
         unsafe {
             Ok(match self.id {
                 VarTypeList::Page => {
@@ -206,7 +205,7 @@ unsafe impl<'a> PageLayout<'a> for LayoutU64Var {
         Ok(delta)
     }
 
-    fn write_value(&self, value: &Self::Value, dest: &mut [u8]) {
+    unsafe fn write_value(&self, value: &Self::Value, dest: &mut [u8]) {
         unsafe {
             match value {
                 VarTypes::Page(p) => {
@@ -226,14 +225,17 @@ unsafe impl<'a> PageLayout<'a> for LayoutU64Var {
         }
     }
 
-    fn write_pair(&self, key: &Self::Key, value: &Self::Value, dest: &mut [u8]) {
+    unsafe fn write_pair(&self, key: &Self::Key, value: &Self::Value, dest: &mut [u8]) {
         unsafe {
-            let key_mask = u64::MAX >> (self.key_len << 3);
+            // Copy the key over
+            let key_mask = u64::MAX >> ((self.info & 7) << 3);
             let key_ptr = dest.as_mut_ptr() as *mut u64;
             let mut new_key = key_ptr.read_unaligned().to_le();
             new_key &= !key_mask;
             new_key |= key;
             key_ptr.write_unaligned(new_key.to_le());
+
+            // Copy the value over
             let val_ptr = dest.as_mut_ptr().add(self.key_len);
             match value {
                 VarTypes::Page(p) => {
@@ -246,7 +248,10 @@ unsafe impl<'a> PageLayout<'a> for LayoutU64Var {
                     ptr.write_unaligned(new_val.to_le());
                 }
                 VarTypes::Ref(r) => r.store(val_ptr),
-                VarTypes::Value(v) => val_ptr.copy_from_nonoverlapping(v.as_ptr(), v.len()),
+                VarTypes::Value(v) => {
+                    let v: &[u8] = v;
+                    val_ptr.copy_from_nonoverlapping(v.as_ptr(), v.len())
+                },
             }
         }
     }

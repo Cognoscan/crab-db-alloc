@@ -1,11 +1,16 @@
 mod traits;
 mod u64_var;
 mod u64_u64;
+mod var_u64;
 pub use traits::*;
 pub use u64_var::*;
 pub use u64_u64::*;
+pub use var_u64::*;
 
 use std::cmp::Ordering;
+
+/// 4 kiB - (8 trailer bytes) - (4 objects) * (8 bytes of other + 2 bytes of layout)
+pub const MAX_VAR_SIZE: usize = 4096 - 8 - (4 * (8 + 2));
 
 use crate::{
     arrays::{KeyValArrayMut, RevSizedArrayMut},
@@ -46,7 +51,10 @@ impl<'a, T: PageLayout<'a>> PageIter<'a, T> {
         };
         let info = T::from_info(info.endian_swap());
         let (key, val) = self.data.next_pair(info.key_len(), info.value_len())?;
-        Ok(Some((info.read_key(key)?, info.read_value(val)?)))
+        // Safety: we constructed our slices using the provided length numbers.
+        unsafe {
+            Ok(Some((info.read_key(key)?, info.read_value(val)?)))
+        }
     }
 
     #[allow(clippy::type_complexity)]
@@ -57,7 +65,10 @@ impl<'a, T: PageLayout<'a>> PageIter<'a, T> {
         };
         let info = T::from_info(info.endian_swap());
         let (key, val) = self.data.next_pair_back(info.key_len(), info.value_len())?;
-        Ok(Some((info.read_key(key)?, info.read_value(val)?)))
+        // Safety: we constructed our slices using the provided length numbers.
+        unsafe {
+            Ok(Some((info.read_key(key)?, info.read_value(val)?)))
+        }
     }
 }
 

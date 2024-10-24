@@ -2,7 +2,7 @@ use crate::Error;
 
 use super::PageLayout;
 
-/// Helper struct for working with the variable-length encoding
+/// U64-to-U64 page map layout.
 pub struct LayoutU64U64 {
     info: u8,
     key_len: usize,
@@ -66,11 +66,11 @@ unsafe impl<'a> PageLayout<'a> for LayoutU64U64 {
         self.val_len
     }
 
-    fn read_key(&self, src: &'a [u8]) -> Result<Self::Key, Error> {
-        unsafe { Ok(self.key_mask & (src.as_ptr() as *const u64).read_unaligned().to_le()) }
+    unsafe fn read_key(&self, src: &'a [u8]) -> Result<Self::Key, Error> {
+        Ok(self.key_mask & (src.as_ptr() as *const u64).read_unaligned().to_le())
     }
 
-    fn read_value(&self, src: &'a [u8]) -> Result<Self::Value, Error> {
+    unsafe fn read_value(&self, src: &'a [u8]) -> Result<Self::Value, Error> {
         unsafe { Ok(self.val_mask & (src.as_ptr() as *const u64).read_unaligned().to_le()) }
     }
 
@@ -88,7 +88,7 @@ unsafe impl<'a> PageLayout<'a> for LayoutU64U64 {
         Ok(delta)
     }
 
-    fn write_pair(&self, key: &Self::Key, value: &Self::Value, dest: &mut [u8]) {
+    unsafe fn write_pair(&self, key: &Self::Key, value: &Self::Value, dest: &mut [u8]) {
         // We first fetch the old data using unaligned reads, as we may be
         // modifying less than 8 bytes on the key/value writes. We can fetch
         // both at the same time, so long as we write the key back first and the
@@ -113,7 +113,7 @@ unsafe impl<'a> PageLayout<'a> for LayoutU64U64 {
         }
     }
 
-    fn write_value(&self, value: &Self::Value, dest: &mut [u8]) {
+    unsafe fn write_value(&self, value: &Self::Value, dest: &mut [u8]) {
         unsafe {
             let ptr = (dest.as_mut_ptr() as *mut u64).byte_add(self.key_len);
             let mut new_val = ptr.read_unaligned().to_le();
