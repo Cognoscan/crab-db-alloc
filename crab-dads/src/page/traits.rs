@@ -39,7 +39,7 @@ impl EndianSwappable for u64 {
 /// - The read operations cannot read more than 8 bytes beyond the end of the
 ///   provided source slices.
 pub unsafe trait PageLayout<'a>: Sized {
-    type Info: AnyBitPattern + EndianSwappable;
+    type Info: AnyBitPattern + EndianSwappable + Clone + Copy;
     type Key: Ord + 'a;
     type Value: 'a;
 

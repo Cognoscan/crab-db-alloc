@@ -1,40 +1,51 @@
 mod traits;
-mod u64_var;
 mod u64_u64;
+mod u64_var;
 mod var_u64;
 pub use traits::*;
-pub use u64_var::*;
 pub use u64_u64::*;
+pub use u64_var::*;
 pub use var_u64::*;
 
 use std::cmp::Ordering;
 
 /// 4 kiB - (8 trailer bytes) - (4 objects) * (8 bytes of other + 2 bytes of layout)
-pub const MAX_VAR_SIZE: usize = 4096 - 8 - (4 * (8 + 2));
+pub const MAX_VAR_SIZE: usize = PAGE_4K - 8 - (4 * (8 + 2));
+
+const CONTENT_SIZE: usize = PAGE_4K - core::mem::size_of::<TwoArrayTrailer>();
 
 use crate::{
     arrays::{KeyValArrayMut, RevSizedArrayMut},
-    Error, TwoArrayTrailer,
+    Error, TwoArrayTrailer, PAGE_4K,
 };
 
 pub type U64VarPageIter<'a> = PageIter<'a, LayoutU64Var>;
 
+#[derive(Debug)]
 pub struct PageIter<'a, T: PageLayout<'a>> {
     info: core::slice::Iter<'a, T::Info>,
     data: crate::arrays::KeyValArray<'a>,
 }
 
+impl<'a, T: PageLayout<'a>> Clone for PageIter<'a, T> {
+    fn clone(&self) -> Self {
+        Self {
+            info: self.info.clone(),
+            data: self.data.clone(),
+        }
+    }
+}
+
 impl<'a, T: PageLayout<'a>> PageIter<'a, T> {
     pub fn iter_page(page: &[u8]) -> Result<Self, Error> {
-        let (content, trailer) = page.split_last_chunk::<8>().ok_or(Error::DataCorruption)?;
-        let trailer = unsafe { &*(trailer.as_ptr() as *const TwoArrayTrailer) };
-        let lengths = trailer.lengths::<u8, T::Info>(content.len())?;
+        debug_assert!(page.len() == PAGE_4K);
+        let trailer = unsafe { &*(page.as_ptr().add(CONTENT_SIZE) as *const TwoArrayTrailer) };
+        let lengths = trailer.lengths::<u8, T::Info>(PAGE_4K)?;
         unsafe {
-            let data = crate::arrays::KeyValArray::new(content.get_unchecked(0..lengths.lower));
+            let data = crate::arrays::KeyValArray::new(page.get_unchecked(0..lengths.lower));
             let info = core::slice::from_raw_parts(
-                content
-                    .as_ptr()
-                    .add(content.len() - lengths.upper_bytes::<T::Info>())
+                page.as_ptr()
+                    .add(CONTENT_SIZE - lengths.upper_bytes::<T::Info>())
                     as *const T::Info,
                 lengths.upper,
             )
@@ -52,9 +63,7 @@ impl<'a, T: PageLayout<'a>> PageIter<'a, T> {
         let info = T::from_info(info.endian_swap());
         let (key, val) = self.data.next_pair(info.key_len(), info.value_len())?;
         // Safety: we constructed our slices using the provided length numbers.
-        unsafe {
-            Ok(Some((info.read_key(key)?, info.read_value(val)?)))
-        }
+        unsafe { Ok(Some((info.read_key(key)?, info.read_value(val)?))) }
     }
 
     #[allow(clippy::type_complexity)]
@@ -66,9 +75,7 @@ impl<'a, T: PageLayout<'a>> PageIter<'a, T> {
         let info = T::from_info(info.endian_swap());
         let (key, val) = self.data.next_pair_back(info.key_len(), info.value_len())?;
         // Safety: we constructed our slices using the provided length numbers.
-        unsafe {
-            Ok(Some((info.read_key(key)?, info.read_value(val)?)))
-        }
+        unsafe { Ok(Some((info.read_key(key)?, info.read_value(val)?))) }
     }
 }
 
@@ -93,30 +100,66 @@ where
     }
 }
 
+pub fn page_trailer(page: &[u8]) -> Result<&TwoArrayTrailer, Error> {
+    debug_assert!(page.len() == PAGE_4K);
+    unsafe {
+        Ok(&*(page
+            .as_ptr()
+            .byte_add(PAGE_4K - core::mem::size_of::<TwoArrayTrailer>())
+            as *const TwoArrayTrailer))
+    }
+}
+
+/// Copy a page's content to a new page.
+pub fn copy_page<'a, T: PageLayout<'a>>(src: &[u8], dst: &mut [u8]) -> Result<(), Error> {
+    debug_assert!(src.len() == PAGE_4K);
+    debug_assert!(dst.len() == PAGE_4K);
+    let trailer = unsafe { &mut *(src.as_ptr().add(CONTENT_SIZE) as *mut TwoArrayTrailer) };
+    let lengths = trailer.lengths::<u8, T::Info>(CONTENT_SIZE)?;
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), lengths.lower);
+        let upper_bytes = lengths.upper_bytes::<T::Info>();
+        let upper_offset = CONTENT_SIZE - upper_bytes;
+        core::ptr::copy_nonoverlapping(
+            src.as_ptr().add(upper_offset),
+            dst.as_mut_ptr().add(upper_offset),
+            upper_bytes + core::mem::size_of::<TwoArrayTrailer>(),
+        );
+    }
+    Ok(())
+}
+
 pub fn page_free_space<'a, T: PageLayout<'a>>(page: &[u8]) -> Result<usize, Error> {
-    let (content, trailer) = page.split_last_chunk::<8>().ok_or(Error::DataCorruption)?;
-    let trailer = unsafe { &*(trailer.as_ptr() as *const TwoArrayTrailer) };
-    let lengths = trailer.lengths::<u8, T::Info>(content.len())?;
-    Ok(content.len() - lengths.total::<u8, T::Info>())
+    debug_assert!(page.len() == PAGE_4K);
+    let trailer = unsafe { &*(page.as_ptr().add(CONTENT_SIZE) as *const TwoArrayTrailer) };
+    let lengths = trailer.lengths::<u8, T::Info>(CONTENT_SIZE)?;
+    Ok(CONTENT_SIZE - lengths.total::<u8, T::Info>())
+}
+
+pub fn insert<'a, T: PageLayout<'a>>(
+    page: &mut [u8],
+    key: T::Key,
+    val: &T::Value,
+) -> Result<(), Error> {
+    match page_entry::<T>(page, key)? {
+        Entry::Occupied(o) => o.update(val),
+        Entry::Vacant(v) => v.insert(val),
+    }
 }
 
 pub fn page_entry<'a, T: PageLayout<'a>>(
     page: &mut [u8],
     key: T::Key,
 ) -> Result<Entry<'a, T>, Error> {
-    let (content, trailer) = page
-        .split_last_chunk_mut::<8>()
-        .ok_or(Error::DataCorruption)?;
-    let trailer = unsafe { &mut *(trailer.as_ptr() as *mut TwoArrayTrailer) };
-    let lengths = trailer.lengths::<u8, T::Info>(content.len())?;
-    let free_space = content.len() - lengths.total::<u8, T::Info>();
+    debug_assert!(page.len() == PAGE_4K);
+    let trailer = unsafe { &mut *(page.as_ptr().add(CONTENT_SIZE) as *mut TwoArrayTrailer) };
+    let lengths = trailer.lengths::<u8, T::Info>(CONTENT_SIZE)?;
+    let free_space = CONTENT_SIZE - lengths.total::<u8, T::Info>();
     unsafe {
-        let mut kv =
-            crate::arrays::KeyValArrayMut::new(content.get_unchecked_mut(0..lengths.lower));
+        let mut kv = crate::arrays::KeyValArrayMut::new(page.get_unchecked_mut(0..lengths.lower));
         let info = core::slice::from_raw_parts_mut(
-            content
-                .as_mut_ptr()
-                .add(content.len() - lengths.upper_bytes::<T::Info>()) as *mut T::Info,
+            page.as_mut_ptr()
+                .add(CONTENT_SIZE - lengths.upper_bytes::<T::Info>()) as *mut T::Info,
             lengths.upper,
         );
         let mut info = crate::arrays::RevSizedArrayMut::new(info);
