@@ -7,7 +7,7 @@ pub use u64_u64::*;
 pub use u64_var::*;
 pub use var_u64::*;
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, marker::PhantomData};
 
 /// 4 kiB - (8 trailer bytes) - (4 objects) * (8 bytes of other + 2 bytes of layout)
 pub const MAX_VAR_SIZE: usize = PAGE_4K - 8 - (4 * (8 + 2));
@@ -19,7 +19,229 @@ use crate::{
     Error, TwoArrayTrailer, PAGE_4K,
 };
 
-pub type U64VarPageIter<'a> = PageIter<'a, LayoutU64Var>;
+#[repr(transparent)]
+pub struct PageMap<'a, T: PageLayout<'a>> {
+    layout: PhantomData<&'a T>,
+    page: [u8],
+}
+
+impl<'a, T: PageLayout<'a>> TryFrom<&[u8]> for &PageMap<'a, T> {
+    type Error = Error;
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        if value.len() != PAGE_4K {
+            return Err(Error::IncorrectPageSize);
+        }
+        // We can transmute because the layout of this type is set to be
+        // `repr(transparent)` for a `[u8]`.
+        let ret: &PageMap<'a, T> = unsafe { core::mem::transmute(value) };
+        let trailer = ret.page_trailer();
+        trailer.lengths::<u8, T::Info>(CONTENT_SIZE)?;
+        Ok(ret)
+    }
+}
+
+impl<'a, T: PageLayout<'a>> TryFrom<&mut [u8]> for &mut PageMap<'a, T> {
+    type Error = Error;
+    fn try_from(value: &mut [u8]) -> Result<Self, Self::Error> {
+        if value.len() != PAGE_4K {
+            return Err(Error::IncorrectPageSize);
+        }
+        // We can transmute because the layout of this type is set to be
+        // `repr(transparent)` for a `[u8]`.
+        let ret: &mut PageMap<'a, T> = unsafe { core::mem::transmute(value) };
+        let trailer = ret.page_trailer();
+        trailer.lengths::<u8, T::Info>(CONTENT_SIZE)?;
+        Ok(ret)
+    }
+}
+
+/// Get a page's type byte.
+pub fn page_type(page: &[u8]) -> Result<u8, Error> {
+    if page.len() != PAGE_4K {
+        return Err(Error::IncorrectPageSize);
+    }
+
+    // Safety: We just verified the provided slice is large enough for us to
+    // perform this offset, and the cast is to a `repr(C)` type with no padding
+    // bytes.
+    let trailer = unsafe {
+        &*(page
+            .as_ptr()
+            .byte_add(PAGE_4K - core::mem::size_of::<TwoArrayTrailer>())
+            as *const TwoArrayTrailer)
+    };
+    Ok(trailer.page_type)
+}
+
+impl<'a, T: PageLayout<'a>> PageMap<'a, T> {
+
+    /// Coerce a slice into a immutable borrow of a PageMap.
+    ///
+    /// # Safety
+    ///
+    /// The safety checks of the corresponding `try_from` must be upheld:
+    ///
+    /// - The slice must be 4 kiB in size.
+    /// - The page trailer layout must make sense for the type.
+    /// 
+    /// Usually this is meant for when `try_from` has already been called on the
+    /// slice, but it needs to be turned into a borrowed `PageMap` multiple times.
+    pub unsafe fn from_slice_unchecked(page: &[u8]) -> &Self {
+        unsafe { core::mem::transmute(page) }
+    }
+
+    /// Coerce a slice into a mutable borrow of a PageMap.
+    ///
+    /// # Safety
+    ///
+    /// The safety checks of the corresponding `try_from` must be upheld:
+    ///
+    /// - The slice must be 4 kiB in size.
+    /// - The page trailer layout must make sense for the type.
+    /// 
+    /// Usually this is meant for when `try_from` has already been called on the
+    /// slice, but it needs to be turned into a borrowed `PageMap` multiple times.
+    pub unsafe fn from_slice_mut_unchecked(page: &mut [u8]) -> &mut Self {
+        unsafe { core::mem::transmute(page) }
+    }
+
+    /// Get the underlying data slice for this page.
+    pub fn slice(&self) -> &[u8] {
+        &self.page
+    }
+
+    pub fn page_trailer(&self) -> &TwoArrayTrailer {
+        unsafe {
+            &*(self
+                .page
+                .as_ptr()
+                .byte_add(PAGE_4K - core::mem::size_of::<TwoArrayTrailer>())
+                as *const TwoArrayTrailer)
+        }
+    }
+
+    pub fn iter(&self) -> PageIter<'a, T> {
+        unsafe {
+            let lengths = self.page_trailer().lengths_unchecked();
+            let data = crate::arrays::KeyValArray::new(self.page.get_unchecked(0..lengths.lower));
+            let info = core::slice::from_raw_parts(
+                self.page
+                    .as_ptr()
+                    .add(CONTENT_SIZE - lengths.upper_bytes::<T::Info>())
+                    as *const T::Info,
+                lengths.upper,
+            )
+            .iter();
+            PageIter { info, data }
+        }
+    }
+
+    pub fn page_trailer_mut(&mut self) -> &mut TwoArrayTrailer {
+        unsafe {
+            &mut *(self
+                .page
+                .as_ptr()
+                .byte_add(PAGE_4K - core::mem::size_of::<TwoArrayTrailer>())
+                as *mut TwoArrayTrailer)
+        }
+    }
+
+    /// Copy a page's content to a new page.
+    pub fn copy_to(&self, dst: &'a mut [u8]) -> Result<&mut PageMap<'a, T>, Error> {
+        if dst.len() != PAGE_4K {
+            return Err(Error::IncorrectPageSize);
+        }
+        unsafe {
+            let lengths = self.page_trailer().lengths_unchecked();
+            core::ptr::copy_nonoverlapping(self.page.as_ptr(), dst.as_mut_ptr(), lengths.lower);
+            let upper_bytes = lengths.upper_bytes::<T::Info>();
+            let upper_offset = CONTENT_SIZE - upper_bytes;
+            core::ptr::copy_nonoverlapping(
+                self.page.as_ptr().add(upper_offset),
+                dst.as_mut_ptr().add(upper_offset),
+                upper_bytes + core::mem::size_of::<TwoArrayTrailer>(),
+            );
+            let new_page: &mut PageMap<'a, T> = core::mem::transmute(dst);
+            Ok(new_page)
+        }
+    }
+
+    /// Get how much free space is in the page
+    pub fn free_space(&self) -> usize {
+        let lengths = unsafe { self.page_trailer().lengths_unchecked() };
+        CONTENT_SIZE - lengths.total::<u8, T::Info>()
+    }
+
+    /// Get an entry in the page
+    pub fn entry(&mut self, key: T::Key) -> Result<Entry<'a, T>, Error> {
+        unsafe {
+            let trailer = &mut *(self
+                .page
+                .as_ptr()
+                .byte_add(PAGE_4K - core::mem::size_of::<TwoArrayTrailer>())
+                as *mut TwoArrayTrailer);
+            let lengths = trailer.lengths_unchecked();
+            let free_space = CONTENT_SIZE - lengths.total::<u8, T::Info>();
+            let mut kv =
+                crate::arrays::KeyValArrayMut::new(self.page.get_unchecked_mut(0..lengths.lower));
+            let info = core::slice::from_raw_parts_mut(
+                self.page
+                    .as_mut_ptr()
+                    .add(CONTENT_SIZE - lengths.upper_bytes::<T::Info>())
+                    as *mut T::Info,
+                lengths.upper,
+            );
+            let mut info = crate::arrays::RevSizedArrayMut::new(info);
+
+            while let Some(pair_info) = info.next_back() {
+                let pair_info = T::from_info(pair_info.endian_swap());
+                let (local_key, val) =
+                    kv.next_pair_back(pair_info.key_len(), pair_info.value_len())?;
+                let local_key = pair_info.read_key(local_key)?;
+                let val = pair_info.read_value(val)?;
+                match local_key.cmp(&key) {
+                    Ordering::Equal => {
+                        return Ok(Entry::Occupied(OccupiedEntry {
+                            key,
+                            val,
+                            trailer,
+                            kv,
+                            info,
+                            pair_info,
+                            free_space,
+                        }))
+                    }
+                    Ordering::Greater => {
+                        return Ok(Entry::Vacant(VacantEntry {
+                            key,
+                            info,
+                            trailer,
+                            kv,
+                            free_space,
+                        }))
+                    }
+                    Ordering::Less => (),
+                }
+            }
+            kv.next_pair_back_none()?;
+            Ok(Entry::Vacant(VacantEntry {
+                key,
+                info,
+                trailer,
+                kv,
+                free_space,
+            }))
+        }
+    }
+
+    /// Insert a key-value pair into the page.
+    pub fn insert(&mut self, key: T::Key, val: &T::Value) -> Result<(), Error> {
+        match self.entry(key)? {
+            Entry::Occupied(mut o) => o.update(val),
+            Entry::Vacant(v) => v.insert(val),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct PageIter<'a, T: PageLayout<'a>> {
@@ -37,23 +259,6 @@ impl<'a, T: PageLayout<'a>> Clone for PageIter<'a, T> {
 }
 
 impl<'a, T: PageLayout<'a>> PageIter<'a, T> {
-    pub fn iter_page(page: &[u8]) -> Result<Self, Error> {
-        debug_assert!(page.len() == PAGE_4K);
-        let trailer = unsafe { &*(page.as_ptr().add(CONTENT_SIZE) as *const TwoArrayTrailer) };
-        let lengths = trailer.lengths::<u8, T::Info>(PAGE_4K)?;
-        unsafe {
-            let data = crate::arrays::KeyValArray::new(page.get_unchecked(0..lengths.lower));
-            let info = core::slice::from_raw_parts(
-                page.as_ptr()
-                    .add(CONTENT_SIZE - lengths.upper_bytes::<T::Info>())
-                    as *const T::Info,
-                lengths.upper,
-            )
-            .iter();
-            Ok(Self { info, data })
-        }
-    }
-
     #[allow(clippy::type_complexity)]
     fn next_internal(&mut self) -> Result<Option<(T::Key, T::Value)>, Error> {
         let Some(info) = self.info.next() else {
@@ -100,115 +305,12 @@ where
     }
 }
 
-pub fn page_trailer(page: &[u8]) -> Result<&TwoArrayTrailer, Error> {
-    debug_assert!(page.len() == PAGE_4K);
-    unsafe {
-        Ok(&*(page
-            .as_ptr()
-            .byte_add(PAGE_4K - core::mem::size_of::<TwoArrayTrailer>())
-            as *const TwoArrayTrailer))
-    }
-}
-
-/// Copy a page's content to a new page.
-pub fn copy_page<'a, T: PageLayout<'a>>(src: &[u8], dst: &mut [u8]) -> Result<(), Error> {
-    debug_assert!(src.len() == PAGE_4K);
-    debug_assert!(dst.len() == PAGE_4K);
-    let trailer = unsafe { &mut *(src.as_ptr().add(CONTENT_SIZE) as *mut TwoArrayTrailer) };
-    let lengths = trailer.lengths::<u8, T::Info>(CONTENT_SIZE)?;
-    unsafe {
-        core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), lengths.lower);
-        let upper_bytes = lengths.upper_bytes::<T::Info>();
-        let upper_offset = CONTENT_SIZE - upper_bytes;
-        core::ptr::copy_nonoverlapping(
-            src.as_ptr().add(upper_offset),
-            dst.as_mut_ptr().add(upper_offset),
-            upper_bytes + core::mem::size_of::<TwoArrayTrailer>(),
-        );
-    }
-    Ok(())
-}
-
-pub fn page_free_space<'a, T: PageLayout<'a>>(page: &[u8]) -> Result<usize, Error> {
-    debug_assert!(page.len() == PAGE_4K);
-    let trailer = unsafe { &*(page.as_ptr().add(CONTENT_SIZE) as *const TwoArrayTrailer) };
-    let lengths = trailer.lengths::<u8, T::Info>(CONTENT_SIZE)?;
-    Ok(CONTENT_SIZE - lengths.total::<u8, T::Info>())
-}
-
-pub fn insert<'a, T: PageLayout<'a>>(
-    page: &mut [u8],
-    key: T::Key,
-    val: &T::Value,
-) -> Result<(), Error> {
-    match page_entry::<T>(page, key)? {
-        Entry::Occupied(o) => o.update(val),
-        Entry::Vacant(v) => v.insert(val),
-    }
-}
-
-pub fn page_entry<'a, T: PageLayout<'a>>(
-    page: &mut [u8],
-    key: T::Key,
-) -> Result<Entry<'a, T>, Error> {
-    debug_assert!(page.len() == PAGE_4K);
-    let trailer = unsafe { &mut *(page.as_ptr().add(CONTENT_SIZE) as *mut TwoArrayTrailer) };
-    let lengths = trailer.lengths::<u8, T::Info>(CONTENT_SIZE)?;
-    let free_space = CONTENT_SIZE - lengths.total::<u8, T::Info>();
-    unsafe {
-        let mut kv = crate::arrays::KeyValArrayMut::new(page.get_unchecked_mut(0..lengths.lower));
-        let info = core::slice::from_raw_parts_mut(
-            page.as_mut_ptr()
-                .add(CONTENT_SIZE - lengths.upper_bytes::<T::Info>()) as *mut T::Info,
-            lengths.upper,
-        );
-        let mut info = crate::arrays::RevSizedArrayMut::new(info);
-
-        while let Some(pair_info) = info.next_back() {
-            let pair_info = T::from_info(pair_info.endian_swap());
-            let (local_key, val) = kv.next_pair_back(pair_info.key_len(), pair_info.value_len())?;
-            let local_key = pair_info.read_key(local_key)?;
-            let val = pair_info.read_value(val)?;
-            match local_key.cmp(&key) {
-                Ordering::Equal => {
-                    return Ok(Entry::Occupied(OccupiedEntry {
-                        key,
-                        val,
-                        trailer,
-                        kv,
-                        info,
-                        pair_info,
-                        free_space,
-                    }))
-                }
-                Ordering::Greater => {
-                    return Ok(Entry::Vacant(VacantEntry {
-                        key,
-                        info,
-                        trailer,
-                        kv,
-                        free_space,
-                    }))
-                }
-                Ordering::Less => (),
-            }
-        }
-        kv.next_pair_back_none()?;
-        Ok(Entry::Vacant(VacantEntry {
-            key,
-            info,
-            trailer,
-            kv,
-            free_space,
-        }))
-    }
-}
-
 pub enum Entry<'a, T: PageLayout<'a>> {
     Occupied(OccupiedEntry<'a, T>),
     Vacant(VacantEntry<'a, T>),
 }
 
+/// An occupied entry in the map, ready to be inspected and modified.
 pub struct OccupiedEntry<'a, T: PageLayout<'a>> {
     key: T::Key,
     val: T::Value,
@@ -243,7 +345,7 @@ impl<'a, T: PageLayout<'a>> OccupiedEntry<'a, T> {
     }
 
     /// Update the value in-place.
-    pub fn update(mut self, new_value: &T::Value) -> Result<(), Error> {
+    pub fn update(&mut self, new_value: &T::Value) -> Result<(), Error> {
         let delta = self.pair_info.update_value(new_value)?;
         unsafe {
             if (self.free_space as isize) < delta {
@@ -259,6 +361,8 @@ impl<'a, T: PageLayout<'a>> OccupiedEntry<'a, T> {
     }
 }
 
+
+/// An empty entry in the map, ready to be filled.
 pub struct VacantEntry<'a, T: PageLayout<'a>> {
     key: T::Key,
     info: RevSizedArrayMut<'a, T::Info>,

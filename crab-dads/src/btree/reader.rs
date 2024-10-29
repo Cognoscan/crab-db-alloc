@@ -1,8 +1,8 @@
 use core::ops::Bound;
-use std::{collections::VecDeque, marker::PhantomData, ops::RangeBounds};
+use std::{borrow::Borrow, cmp::Ordering, collections::VecDeque, ops::RangeBounds};
 
 use crate::{
-    page::{self, PageIter, PageLayout},
+    page::{self, PageIter, PageLayout, PageMap},
     Error, PAGE_4K,
 };
 
@@ -12,13 +12,109 @@ use super::BlockRange;
 pub trait RawRead {
     /// Load a memory range. If out of range of the backing store, it should
     /// return None.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the requested range won't be used mutably
-    /// elsewhere in the program - the RawRead object doesn't need to enforce
-    /// this.
-    unsafe fn load(&self, range: BlockRange) -> Option<&[u8]>;
+    fn load(&self, range: BlockRange) -> Option<&[u8]>;
+}
+
+fn trim_leaf<I, R, K, V, Q>(iter: &mut I, range: &R) -> Result<(), Error>
+where
+    I: Iterator<Item = Result<(K, V), Error>> + Clone,
+    R: RangeBounds<Q>,
+    K: Borrow<Q> + Ord,
+    Q: Ord + ?Sized,
+{
+    // Trim the front
+    let mut peek = iter.clone();
+    while let Some(result) = peek.next() {
+        let (k, _) = result?;
+        match range.start_bound() {
+            Bound::Unbounded => break,
+            Bound::Excluded(b) => {
+                if k.borrow() > b {
+                    break;
+                }
+            }
+            Bound::Included(b) => {
+                if k.borrow() >= b {
+                    break;
+                }
+            }
+        }
+        *iter = peek.clone();
+    }
+
+    // Trim the back
+    let mut peek = iter.clone();
+    while let Some(result) = peek.next() {
+        let (k, _) = result?;
+        match range.end_bound() {
+            Bound::Unbounded => break,
+            Bound::Excluded(b) => {
+                if k.borrow() < b {
+                    break;
+                }
+            }
+            Bound::Included(b) => {
+                if k.borrow() >= b {
+                    break;
+                }
+            }
+        }
+        *iter = peek.clone();
+    }
+
+    Ok(())
+}
+
+fn trim_branch<I, R, K, V, Q>(iter: &mut I, range: &R) -> Result<(), Error>
+where
+    I: Iterator<Item = Result<(K, V), Error>> + Clone,
+    R: RangeBounds<Q>,
+    K: Borrow<Q> + Ord,
+    Q: Ord + ?Sized,
+{
+    // Trim the front.
+    // We look two keys ahead - if we are greater than the key we take, that
+    // means that the previous page contains keys we want to iterate on, which
+    // means we need to have not taken that previous page from the iterator.
+    let mut peek = iter.clone();
+    let mut peek2 = iter.clone();
+    while let Some(result) = peek2.next() {
+        let (k, _) = result?;
+        match range.start_bound() {
+            Bound::Unbounded => break,
+            Bound::Excluded(b) | Bound::Included(b) => match k.borrow().cmp(&b) {
+                Ordering::Greater => (),
+                Ordering::Equal => {
+                    *iter = peek;
+                    break;
+                }
+                Ordering::Less => break,
+            },
+        }
+        *iter = core::mem::replace(&mut peek, peek2.clone());
+    }
+
+    // Trim the back
+    let mut peek = iter.clone();
+    while let Some(result) = peek.next() {
+        let (k, _) = result?;
+        match range.end_bound() {
+            Bound::Unbounded => break,
+            Bound::Excluded(b) => {
+                if k.borrow() < b {
+                    break;
+                }
+            }
+            Bound::Included(b) => {
+                if k.borrow() <= b {
+                    break;
+                }
+            }
+        }
+        *iter = peek.clone();
+    }
+
+    Ok(())
 }
 
 pub struct BTreeRead<'a, B, L, R>
@@ -28,97 +124,60 @@ where
     R: RawRead,
 {
     reader: &'a R,
-    root: &'a [u8],
-    branches: PhantomData<B>,
-    leaf: PhantomData<L>,
+    root: ReadPage<'a, B, L>,
 }
 
-fn trim_leaf<I, R, K, V>(iter: &mut I, range: &R) -> Result<(), Error>
+pub(crate) enum ReadPage<'a, B, L>
 where
-    I: Iterator<Item = Result<(K, V), Error>> + Clone,
-    R: RangeBounds<K>,
-    K: Ord,
+    B: PageLayout<'a, Value = u64>,
+    L: PageLayout<'a, Key = B::Key>,
 {
-    // Trim the front
-    let mut peek = iter.clone();
-    while let Some(result) = peek.next() {
-        let (k, _) = result?;
-        match range.start_bound() {
-            Bound::Unbounded => break,
-            Bound::Excluded(b) => {
-                if k > *b {
-                    break;
-                }
-            }
-            Bound::Included(b) => {
-                if k >= *b {
-                    break;
-                }
-            }
-        }
-        *iter = peek.clone();
-    }
-
-    // Trim the back
-    let mut peek = iter.clone();
-    while let Some(result) = peek.next() {
-        let (k, _) = result?;
-        match range.end_bound() {
-            Bound::Unbounded => break,
-            Bound::Excluded(b) => {
-                if k < *b {
-                    break;
-                }
-            }
-            Bound::Included(b) => {
-                if k >= *b {
-                    break;
-                }
-            }
-        }
-        *iter = peek.clone();
-    }
-
-    Ok(())
+    Branch(&'a PageMap<'a, B>),
+    Leaf(&'a PageMap<'a, L>),
 }
 
-fn trim_branch<I, R, K, V>(iter: &mut I, range: &R) -> Result<(), Error>
+impl<'a, B, L> Clone for ReadPage<'a, B, L>
 where
-    I: Iterator<Item = Result<(K, V), Error>> + Clone,
-    R: RangeBounds<K>,
-    K: Ord,
+    B: PageLayout<'a, Value = u64>,
+    L: PageLayout<'a, Key = B::Key>,
 {
-    // Trim the front
-    let mut peek = iter.clone();
-    while let Some(result) = peek.next() {
-        let (k, _) = result?;
-        match range.start_bound() {
-            Bound::Unbounded => break,
-            Bound::Excluded(b) | Bound::Included(b) => {
-                if k >= *b {
-                    break;
-                }
-            }
+    fn clone(&self) -> Self {
+        match self {
+            Self::Branch(b) => Self::Branch(b),
+            Self::Leaf(l) => Self::Leaf(l),
         }
-        *iter = peek.clone();
     }
+}
 
-    // Trim the back
-    let mut peek = iter.clone();
-    while let Some(result) = peek.next() {
-        let (k, _) = result?;
-        match range.end_bound() {
-            Bound::Unbounded => break,
-            Bound::Excluded(b) | Bound::Included(b) => {
-                if k <= *b {
-                    break;
-                }
-            }
-        }
-        *iter = peek.clone();
+impl<'a, B, L> TryFrom<&'a [u8]> for ReadPage<'a, B, L>
+where
+    B: PageLayout<'a, Value = u64>,
+    L: PageLayout<'a, Key = B::Key>,
+{
+    type Error = Error;
+
+    fn try_from(value: &'a [u8]) -> Result<Self, Self::Error> {
+        let page_type = page::page_type(value)?;
+        Ok(if (page_type & 1) == 1 {
+            ReadPage::Leaf(value.try_into()?)
+        } else {
+            ReadPage::Branch(value.try_into()?)
+        })
     }
+}
 
-    Ok(())
+impl<'a, B, L> ReadPage<'a, B, L>
+where
+    B: PageLayout<'a, Value = u64>,
+    L: PageLayout<'a, Key = B::Key>,
+{
+    fn try_load<R: RawRead>(reader: &'a R, page_addr: u64) -> Result<Self, Error> {
+        let page_mem = reader
+            .load(BlockRange::new(page_addr, PAGE_4K))
+            .ok_or(Error::DataCorruption)?;
+
+        Self::try_from(page_mem)
+    }
 }
 
 impl<'a, B, L, R> BTreeRead<'a, B, L, R>
@@ -128,42 +187,75 @@ where
     R: RawRead,
 {
     /// Load in the root page of a tree.
-    ///
-    /// # Safety
-    ///
-    /// The provided page (and any child pages it may later navigate to) must
-    /// all not be used mutably elsewhere in the program.
-    pub unsafe fn load(reader: &'a R, page: u64) -> Result<Self, Error> {
+    pub fn load(reader: &'a R, page: u64) -> Result<Self, Error> {
         let start = page * (PAGE_4K as u64);
         let root = reader
-            .load(BlockRange { start, len: PAGE_4K })
+            .load(BlockRange {
+                start,
+                len: PAGE_4K,
+            })
             .ok_or(Error::DataCorruption)?;
         Ok(Self {
             reader,
-            root,
-            branches: PhantomData,
-            leaf: PhantomData,
+            root: root.try_into()?,
         })
     }
 
-    pub fn iter(&self, range: R) -> Result<BTreeIter<'a, B, L, R>, Error>
+    /// Fetch the value for a key
+    pub fn get<Q>(&self, key: &Q) -> Result<Option<L::Value>, Error> 
     where
-        R: RangeBounds<L::Key>,
+        L::Key: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let mut page: ReadPage<'a, B, L> = self.root.clone();
+        'outer: loop {
+            match page {
+                ReadPage::Branch(b) => {
+                    for result in b.iter().rev() {
+                        let (k, v) = result?;
+                        if k.borrow() <= key {
+                            page = ReadPage::try_load(self.reader, v)?;
+                            continue 'outer;
+                        }
+                    }
+                    return Ok(None);
+                }
+                ReadPage::Leaf(l) => {
+                    for result in l.iter() {
+                        let (k, v) = result?;
+                        match k.borrow().cmp(&key) {
+                            Ordering::Equal => return Ok(Some(v)),
+                            Ordering::Greater => continue,
+                            Ordering::Less => return Ok(None),
+                        }
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    pub fn range<T, RANGE>(&self, range: RANGE) -> Result<BTreeIter<'a, B, L, R>, Error>
+    where
+        T: Ord + ?Sized,
+        L::Key: Borrow<T> + Ord,
+        RANGE: RangeBounds<T>,
     {
         // Check for the single-leaf case
-        if (page::page_trailer(self.root)?.page_type & 1) == 1 {
-            let mut iter: PageIter<'a, L> = PageIter::iter_page(self.root)?;
-
-            trim_leaf(&mut iter, &range)?;
-
-            return Ok(BTreeIter {
-                reader: self.reader,
-                state: BTreeIterState::Leaf(iter),
-            });
-        }
+        let base = match self.root {
+            ReadPage::Leaf(l) => {
+                let mut iter = l.iter();
+                trim_leaf(&mut iter, &range)?;
+                return Ok(BTreeIter {
+                    reader: self.reader,
+                    state: BTreeIterState::Leaf(iter),
+                });
+            }
+            ReadPage::Branch(b) => b,
+        };
 
         // Grab the base branch and trim it
-        let mut base: PageIter<'a, B> = PageIter::iter_page(self.root)?;
+        let mut base = base.iter();
         trim_branch(&mut base, &range)?;
 
         let mut left = VecDeque::with_capacity(8);
@@ -195,24 +287,18 @@ where
                 break page?.1 * (PAGE_4K as u64);
             };
 
-            // Retrieve the memory of the page
-            let page_mem = unsafe {
-                self.reader
-                    .load(BlockRange::new(page_addr, PAGE_4K))
-                    .ok_or(Error::DataCorruption)?
-            };
-
-            // Handle when we finally hit a leaf
-            if (page::page_trailer(page_mem)?.page_type & 1) == 1 {
-                let mut iter: PageIter<'a, L> = PageIter::iter_page(page_mem)?;
-                trim_leaf(&mut iter, &range)?;
-                break iter;
+            match ReadPage::try_load(self.reader, page_addr)? {
+                ReadPage::Branch(b) => {
+                    let mut iter = b.iter();
+                    trim_branch(&mut iter, &range)?;
+                    left.push_back(iter);
+                }
+                ReadPage::Leaf(l) => {
+                    let mut iter = l.iter();
+                    trim_leaf(&mut iter, &range)?;
+                    break iter;
+                }
             }
-
-            // Parse as a branch, push onto the vec.
-            let mut iter: PageIter<'a, B> = PageIter::iter_page(page_mem)?;
-            trim_branch(&mut iter, &range)?;
-            left.push_back(iter);
         };
 
         // Descend on the right side this time, zippering up the left-hand side
@@ -246,24 +332,18 @@ where
             };
             let page_addr = page?.1 * (PAGE_4K as u64);
 
-            // Retrieve the memory of the page
-            let page_mem = unsafe {
-                self.reader
-                    .load(BlockRange::new(page_addr, PAGE_4K))
-                    .ok_or(Error::DataCorruption)?
-            };
-
-            // Handle when we finally hit a leaf
-            if (page::page_trailer(page_mem)?.page_type & 1) == 1 {
-                let mut iter: PageIter<'a, L> = PageIter::iter_page(page_mem)?;
-                trim_leaf(&mut iter, &range)?;
-                break iter;
+            match ReadPage::try_load(self.reader, page_addr)? {
+                ReadPage::Branch(b) => {
+                    let mut iter = b.iter();
+                    trim_branch(&mut iter, &range)?;
+                    right.push_back(iter);
+                }
+                ReadPage::Leaf(l) => {
+                    let mut iter = l.iter();
+                    trim_leaf(&mut iter, &range)?;
+                    break iter;
+                }
             }
-
-            // Parse as a branch, push onto the vec.
-            let mut iter: PageIter<'a, B> = PageIter::iter_page(page_mem)?;
-            trim_branch(&mut iter, &range)?;
-            right.push_back(iter);
         };
 
         Ok(BTreeIter {
@@ -302,17 +382,17 @@ struct BTreeIterFull<'a, B, L>
 where
     B: PageLayout<'a, Value = u64>,
     L: PageLayout<'a, Key = B::Key>,
-    {
-        left: VecDeque<PageIter<'a, B>>,
-        right: VecDeque<PageIter<'a, B>>,
-        left_leaf: PageIter<'a, L>,
-        right_leaf: PageIter<'a, L>,
+{
+    left: VecDeque<PageIter<'a, B>>,
+    right: VecDeque<PageIter<'a, B>>,
+    left_leaf: PageIter<'a, L>,
+    right_leaf: PageIter<'a, L>,
 }
 
 impl<'a, B, L, R> BTreeIter<'a, B, L, R>
 where
-    B: PageLayout<'a, Value = u64>,
-    L: PageLayout<'a, Key = B::Key>,
+    B: PageLayout<'a, Value = u64> + 'a,
+    L: PageLayout<'a, Key = B::Key> + 'a,
     R: RawRead,
 {
     #[allow(clippy::type_complexity)]
@@ -348,21 +428,15 @@ where
             };
             let page_addr = page?.1 * (PAGE_4K as u64);
 
-            let page_mem = unsafe {
-                self.reader.load(BlockRange::new(page_addr, PAGE_4K)).ok_or(Error::DataCorruption)?
-            };
-
-            // Extract our next leaf and start iterating on it.
-            if (page::page_trailer(page_mem)?.page_type & 1) == 1 {
-                let mut iter: PageIter<'a, L> = PageIter::iter_page(page_mem)?;
-                let ret = iter.next().transpose();
-                full.left_leaf = iter;
-                return ret;
+            match ReadPage::try_load(self.reader, page_addr)? {
+                ReadPage::Branch(b) => full.left.push_back(b.iter()),
+                ReadPage::Leaf(l) => {
+                    let mut iter = l.iter();
+                    let ret = iter.next().transpose();
+                    full.left_leaf = iter;
+                    return ret;
+                }
             }
-
-            // Parse as a branch, push onto the stack.
-            let iter: PageIter<'a, B> = PageIter::iter_page(page_mem)?;
-            full.left.push_back(iter);
         }
     }
 
@@ -399,29 +473,23 @@ where
             };
             let page_addr = page?.1 * (PAGE_4K as u64);
 
-            let page_mem = unsafe {
-                self.reader.load(BlockRange::new(page_addr, PAGE_4K)).ok_or(Error::DataCorruption)?
-            };
-
-            // Extract our next leaf and start iterating on it.
-            if (page::page_trailer(page_mem)?.page_type & 1) == 1 {
-                let mut iter: PageIter<'a, L> = PageIter::iter_page(page_mem)?;
-                let ret = iter.next_back().transpose();
-                full.right_leaf = iter;
-                return ret;
+            match ReadPage::try_load(self.reader, page_addr)? {
+                ReadPage::Branch(b) => full.right.push_back(b.iter()),
+                ReadPage::Leaf(l) => {
+                    let mut iter = l.iter();
+                    let ret = iter.next_back().transpose();
+                    full.right_leaf = iter;
+                    return ret;
+                }
             }
-
-            // Parse as a branch, push onto the stack.
-            let iter: PageIter<'a, B> = PageIter::iter_page(page_mem)?;
-            full.right.push_back(iter);
         }
     }
 }
 
 impl<'a, B, L, R> Iterator for BTreeIter<'a, B, L, R>
 where
-    B: PageLayout<'a, Value = u64>,
-    L: PageLayout<'a, Key = B::Key>,
+    B: PageLayout<'a, Value = u64> + 'a,
+    L: PageLayout<'a, Key = B::Key> + 'a,
     R: RawRead,
 {
     type Item = Result<(L::Key, L::Value), Error>;
@@ -429,18 +497,15 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         self.next_internal().transpose()
     }
-
 }
 
 impl<'a, B, L, R> DoubleEndedIterator for BTreeIter<'a, B, L, R>
 where
-    B: PageLayout<'a, Value = u64>,
-    L: PageLayout<'a, Key = B::Key>,
+    B: PageLayout<'a, Value = u64> + 'a,
+    L: PageLayout<'a, Key = B::Key> + 'a,
     R: RawRead,
 {
-
     fn next_back(&mut self) -> Option<Self::Item> {
         self.next_back_internal().transpose()
     }
-
 }
