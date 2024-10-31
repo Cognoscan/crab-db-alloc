@@ -119,6 +119,9 @@ unsafe impl<'a> PageLayout<'a> for LayoutVarU64 {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+    use std::prelude::rust_2021::*;
+    use std::{vec, println};
     use super::*;
 
     #[test]

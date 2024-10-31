@@ -1,19 +1,16 @@
-use core::ops::Bound;
-use std::{borrow::Borrow, cmp::Ordering, collections::VecDeque, ops::RangeBounds};
+use alloc::collections::VecDeque;
+use core::{
+    borrow::Borrow,
+    cmp::Ordering,
+    ops::{Bound, RangeBounds},
+};
 
 use crate::{
     page::{self, PageIter, PageLayout, PageMap},
-    Error, PAGE_4K,
+    Error,
 };
 
-use super::BlockRange;
-
-/// Access to a backing reader.
-pub trait RawRead {
-    /// Load a memory range. If out of range of the backing store, it should
-    /// return None.
-    fn load(&self, range: BlockRange) -> Option<&[u8]>;
-}
+use super::RawRead;
 
 fn trim_leaf<I, R, K, V, Q>(iter: &mut I, range: &R) -> Result<(), Error>
 where
@@ -132,8 +129,8 @@ where
     B: PageLayout<'a, Value = u64>,
     L: PageLayout<'a, Key = B::Key>,
 {
-    Branch(&'a PageMap<'a, B>),
-    Leaf(&'a PageMap<'a, L>),
+    Branch(PageMap<'a, B>),
+    Leaf(PageMap<'a, L>),
 }
 
 impl<'a, B, L> Clone for ReadPage<'a, B, L>
@@ -143,26 +140,9 @@ where
 {
     fn clone(&self) -> Self {
         match self {
-            Self::Branch(b) => Self::Branch(b),
-            Self::Leaf(l) => Self::Leaf(l),
+            Self::Branch(p) => Self::Branch(p.clone()),
+            Self::Leaf(p) => Self::Leaf(p.clone()),
         }
-    }
-}
-
-impl<'a, B, L> TryFrom<&'a [u8]> for ReadPage<'a, B, L>
-where
-    B: PageLayout<'a, Value = u64>,
-    L: PageLayout<'a, Key = B::Key>,
-{
-    type Error = Error;
-
-    fn try_from(value: &'a [u8]) -> Result<Self, Self::Error> {
-        let page_type = page::page_type(value)?;
-        Ok(if (page_type & 1) == 1 {
-            ReadPage::Leaf(value.try_into()?)
-        } else {
-            ReadPage::Branch(value.try_into()?)
-        })
     }
 }
 
@@ -171,12 +151,13 @@ where
     B: PageLayout<'a, Value = u64>,
     L: PageLayout<'a, Key = B::Key>,
 {
-    fn try_load<R: RawRead>(reader: &'a R, page_addr: u64) -> Result<Self, Error> {
-        let page_mem = reader
-            .load(BlockRange::new(page_addr, PAGE_4K))
-            .ok_or(Error::DataCorruption)?;
-
-        Self::try_from(page_mem)
+    unsafe fn try_load<R: RawRead>(reader: &'a R, page: u64) -> Result<Self, Error> {
+        let page_ptr = unsafe { reader.load_page(page)? };
+        if (page::page_type(page_ptr) & 1) == 1 {
+            Ok(ReadPage::Leaf(PageMap::from_ptr(page_ptr)?))
+        } else {
+            Ok(ReadPage::Branch(PageMap::from_ptr(page_ptr)?))
+        }
     }
 }
 
@@ -187,22 +168,25 @@ where
     R: RawRead,
 {
     /// Load in the root page of a tree.
-    pub fn load(reader: &'a R, page: u64) -> Result<Self, Error> {
-        let start = page * (PAGE_4K as u64);
-        let root = reader
-            .load(BlockRange {
-                start,
-                len: PAGE_4K,
-            })
-            .ok_or(Error::DataCorruption)?;
-        Ok(Self {
-            reader,
-            root: root.try_into()?,
-        })
+    ///
+    /// # Safety
+    ///
+    /// The root page must have come from either a parent tree or be the root
+    /// page of the database.
+    pub unsafe fn load(reader: &'a R, page: u64) -> Result<Self, Error> {
+        let root = ReadPage::try_load(reader, page)?;
+        Ok(Self { reader, root })
     }
 
-    /// Fetch the value for a key
-    pub fn get<Q>(&self, key: &Q) -> Result<Option<L::Value>, Error> 
+    pub(crate) unsafe fn from_parts(reader: &'a R, root: ReadPage<'a, B, L>) -> Self {
+        Self {
+            reader,
+            root,
+        }
+    }
+
+    /// Fetch the value for a key.
+    pub fn get<Q>(&self, key: &Q) -> Result<Option<L::Value>, Error>
     where
         L::Key: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -214,7 +198,7 @@ where
                     for result in b.iter().rev() {
                         let (k, v) = result?;
                         if k.borrow() <= key {
-                            page = ReadPage::try_load(self.reader, v)?;
+                            page = unsafe { ReadPage::try_load(self.reader, v)? };
                             continue 'outer;
                         }
                     }
@@ -223,7 +207,8 @@ where
                 ReadPage::Leaf(l) => {
                     for result in l.iter() {
                         let (k, v) = result?;
-                        match k.borrow().cmp(&key) {
+                        let k: &Q = k.borrow();
+                        match k.cmp(key) {
                             Ordering::Equal => return Ok(Some(v)),
                             Ordering::Greater => continue,
                             Ordering::Less => return Ok(None),
@@ -242,7 +227,7 @@ where
         RANGE: RangeBounds<T>,
     {
         // Check for the single-leaf case
-        let base = match self.root {
+        let base = match &self.root {
             ReadPage::Leaf(l) => {
                 let mut iter = l.iter();
                 trim_leaf(&mut iter, &range)?;
@@ -284,10 +269,11 @@ where
                     left.pop_back();
                     continue;
                 };
-                break page?.1 * (PAGE_4K as u64);
+                break page?.1;
             };
 
-            match ReadPage::try_load(self.reader, page_addr)? {
+            let new_page = unsafe { ReadPage::try_load(self.reader, page_addr)? };
+            match new_page {
                 ReadPage::Branch(b) => {
                     let mut iter = b.iter();
                     trim_branch(&mut iter, &range)?;
@@ -330,9 +316,10 @@ where
                     left.pop_front();
                 }
             };
-            let page_addr = page?.1 * (PAGE_4K as u64);
+            let page_addr = page?.1;
 
-            match ReadPage::try_load(self.reader, page_addr)? {
+            let new_page = unsafe { ReadPage::try_load(self.reader, page_addr)? };
+            match new_page {
                 ReadPage::Branch(b) => {
                     let mut iter = b.iter();
                     trim_branch(&mut iter, &range)?;
@@ -426,9 +413,10 @@ where
                     full.right.pop_front();
                 }
             };
-            let page_addr = page?.1 * (PAGE_4K as u64);
+            let page_addr = page?.1;
 
-            match ReadPage::try_load(self.reader, page_addr)? {
+            let new_page = unsafe { ReadPage::try_load(self.reader, page_addr)? };
+            match new_page {
                 ReadPage::Branch(b) => full.left.push_back(b.iter()),
                 ReadPage::Leaf(l) => {
                     let mut iter = l.iter();
@@ -471,9 +459,10 @@ where
                     full.left.pop_front();
                 }
             };
-            let page_addr = page?.1 * (PAGE_4K as u64);
+            let page_addr = page?.1;
 
-            match ReadPage::try_load(self.reader, page_addr)? {
+            let new_page = unsafe { ReadPage::try_load(self.reader, page_addr)? };
+            match new_page {
                 ReadPage::Branch(b) => full.right.push_back(b.iter()),
                 ReadPage::Leaf(l) => {
                     let mut iter = l.iter();

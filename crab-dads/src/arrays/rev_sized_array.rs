@@ -1,4 +1,4 @@
-use std::{iter::FusedIterator, marker::PhantomData};
+use core::{iter::FusedIterator, marker::PhantomData};
 
 use bytemuck::AnyBitPattern;
 

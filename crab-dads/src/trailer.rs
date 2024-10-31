@@ -30,12 +30,12 @@ impl TwoArrayLengths {
 
     /// Get the number of bytes in the lower array, given its element type (`L`).
     pub fn lower_bytes<L>(&self) -> usize {
-        self.lower * std::mem::size_of::<L>()
+        self.lower * core::mem::size_of::<L>()
     }
 
     /// Get the number of bytes in the upper array, given its element type (`U`).
     pub fn upper_bytes<U>(&self) -> usize {
-        self.upper * std::mem::size_of::<U>()
+        self.upper * core::mem::size_of::<U>()
     }
 }
 

@@ -2,7 +2,7 @@
 name = "crab-dads"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.81"
 
 [dependencies]
-thiserror = "1"
-bytemuck = { version = "1", features = ["derive"] }
+bytemuck = "1"
