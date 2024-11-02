@@ -8,6 +8,24 @@ pub use writer::*;
 use crate::{page, Error, StorageError};
 
 /// Access to a backing reader.
+/// 
+/// # Safety
+/// 
+/// It's complicated. This is really meant for the `crab-db` approach to page
+/// allocation, but roughly:
+///
+/// - There should be one writer (`RawWrite`), and one or more readers
+/// (`RawRead`).
+/// - While a `RawWrite` is active, it should not provide writeable pages that a
+///   reader might potentially see.
+/// - All handed out pointers should point to memory that is 4 kiB in size.
+/// - When a writer "commits" all the work that has been done, it should become
+///   visible to other readers that are opened up after the commit.
+/// - If put into persistent storage, either the system guarantees the backing
+///   file hasn't been touched by any other program, or it does active
+///   verification checking to ensure that any pages allocated by `RawWrite` are
+///   never provided to a reader via `RawRead` or `load_page_mut`'s
+///   `LoadMut::Clean` return value.
 pub unsafe trait RawRead {
     /// Load a 4 kiB page.
     ///
@@ -87,23 +105,21 @@ impl<'a, W: RawWrite> BTreeVarU64Mut<'a, W> {
         Ok((Self(s), page))
     }
 
+    /// Get a value from the tree.
     pub fn get(&self, key: &[u8]) -> Result<Option<u64>, Error> {
         self.0.as_read::<page::LayoutVarU64, page::LayoutVarU64>().get(key)
     }
 
-    /*
-    pub fn iter<'s, 'b, R: RangeBounds<&'b [u8]>>(
-        &'s self,
-        range: R,
-    ) -> Result<impl Iterator<Item = Result<(&'b [u8], u64), Error>>, Error>
+    /// Iterate immutably over a range of the tree.
+    pub fn range<'s, T, RB>(&'s self, range: RB) -> Result<impl Iterator<Item = Result<(&'s [u8], u64), Error>>, Error>
     where
-        'a: 'b,
-        's: 'b,
+        T: Ord + ?Sized,
+        &'s [u8]: Borrow<T> + Ord,
+        RB: RangeBounds<T>,
     {
-        BTreeRead::<page::LayoutVarU64, page::LayoutVarU64, W>::load(self.writer, self.page)?
-            .iter(range)
+        self.0.as_read::<page::LayoutVarU64, page::LayoutVarU64>().range(range)
     }
-    */
+
 }
 
 pub struct BTreeVarU64<'a, R: RawRead>(BTreeRead<'a, page::LayoutVarU64, page::LayoutVarU64, R>);

@@ -19,6 +19,14 @@ impl<'a, T: AnyBitPattern> RevSizedArray<'a, T> {
             data: PhantomData,
         }
     }
+
+    /// Get how many remaining bytes are in the array.
+    pub fn remaining_bytes(&self) -> usize {
+        unsafe {
+            self.front.byte_offset_from(self.back) as usize
+        }
+    }
+
 }
 
 impl<'a, T: AnyBitPattern> Iterator for RevSizedArray<'a, T> {
@@ -78,6 +86,13 @@ impl<'a, T: AnyBitPattern> RevSizedArrayMut<'a, T> {
             end: range.start,
             prev_back: range.start,
             data: PhantomData,
+        }
+    }
+
+    /// Get how many remaining bytes are in the array.
+    pub fn remaining_bytes(&self) -> usize {
+        unsafe {
+            self.front.byte_offset_from(self.back) as usize
         }
     }
 

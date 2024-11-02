@@ -52,6 +52,7 @@ pub enum Error {
     DataCorruption,
     WriteTooLarge,
     Storage(StorageError),
+    UnexpectedNoOp,
 }
 
 impl core::error::Error for Error {
@@ -71,6 +72,7 @@ impl core::fmt::Display for Error {
             Self::DataCorruption => f.write_str("Data Corruption"),
             Self::WriteTooLarge => f.write_str("Provided Key/Value is too large to fit in the map"),
             Self::Storage(_) => f.write_str("Storage system error"),
+            Self::UnexpectedNoOp => f.write_str("Expected to perform an operation (page split, page rebalance) but couldn't"),
         }
     }
 }

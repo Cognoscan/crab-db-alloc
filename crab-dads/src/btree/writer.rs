@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::slice;
 
 use crate::{
@@ -80,8 +81,8 @@ where
 
     pub fn as_read<'b, B2, L2>(&'b self) -> BTreeRead<'b, B2, L2, W>
     where
-        B2: PageLayout<'b, Key = B::Key, Value = u64>,
-        L2: PageLayout<'b, Key = B::Key, Value = L::Value>,
+        B2: PageLayout<'b, Info = B::Info ,Key = B::Key, Value = u64>,
+        L2: PageLayout<'b, Info = L::Info ,Key = B::Key, Value = L::Value>,
     {
         let root = unsafe {
             match &self.root {
@@ -95,14 +96,73 @@ where
         };
         unsafe { BTreeRead::from_parts(self.writer, root) }
     }
-    //pub fn as_read(&self) -> BTreeRead<'a, B, L, W>
-    //{
-    //    let root = unsafe {match &self.root {
-    //        WritePage::Branch(p) => ReadPage::Branch(p.as_const().clone()),
-    //        WritePage::Leaf(p) => ReadPage::Leaf(p.as_const().clone()),
-    //    }};
-    //    unsafe {
-    //        BTreeRead::from_parts(&self.writer, root)
-    //    }
-    //}
+
+    pub fn entry<'b, B2, L2>(&'b mut self, key: L::Key) -> Result<Entry<'b, B2, L2, W>, Error>
+    where
+        B2: PageLayout<'b, Info = B::Info ,Key = B::Key, Value = u64>,
+        L2: PageLayout<'b, Info = L::Info ,Key = B::Key, Value = L::Value>,
+    {
+        // Single-leaf case
+        let base = match &mut self.root {
+            WritePage::Leaf(l) => match l.entry(key)? {
+                page::Entry::Occupied(e) => {
+                    // Safety: This only works because we're mutably borrowing
+                    // from this B-Tree until modification is done, and
+                    // PageMapMut doesn't have any internal state that we need
+                    // to maintain.
+                    return Ok(Entry::Occupied(OccupiedEntry {
+                        writer: self.writer,
+                        entry: e,
+                        leaf: unsafe { PageMapMut::from_ptr_unchecked(l.as_ptr()) },
+                        parents: Vec::new(),
+                    }));
+                }
+                page::Entry::Vacant(e) => {
+                    return Ok(Entry::Vacant(VacantEntry {
+                        writer: self.writer,
+                        entry: e,
+                        leaf: unsafe { PageMapMut::from_ptr_unchecked(l.as_ptr()) },
+                        parents: Vec::new(),
+                    }));
+                }
+            },
+            WritePage::Branch(b) => b,
+        };
+
+        todo!()
+    }
+}
+
+pub enum Entry<'a, B, L, W>
+where
+    B: PageLayout<'a, Value = u64>,
+    L: PageLayout<'a, Key = B::Key>,
+    W: RawWrite,
+{
+    Occupied(OccupiedEntry<'a, B, L, W>),
+    Vacant(VacantEntry<'a, B, L, W>),
+}
+
+pub struct OccupiedEntry<'a, B, L, W>
+where
+    B: PageLayout<'a, Value = u64>,
+    L: PageLayout<'a, Key = B::Key>,
+    W: RawWrite,
+{
+    writer: &'a mut W,
+    entry: page::OccupiedEntry<'a, L>,
+    leaf: PageMapMut<'a, L>,
+    parents: Vec<PageMapMut<'a, B>>,
+}
+
+pub struct VacantEntry<'a, B, L, W>
+where
+    B: PageLayout<'a, Value = u64>,
+    L: PageLayout<'a, Key = B::Key>,
+    W: RawWrite,
+{
+    writer: &'a mut W,
+    entry: page::VacantEntry<'a, L>,
+    leaf: PageMapMut<'a, L>,
+    parents: Vec<PageMapMut<'a, B>>,
 }

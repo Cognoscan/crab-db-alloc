@@ -79,14 +79,17 @@ where
         let (k, _) = result?;
         match range.start_bound() {
             Bound::Unbounded => break,
-            Bound::Excluded(b) | Bound::Included(b) => match k.borrow().cmp(&b) {
-                Ordering::Greater => (),
-                Ordering::Equal => {
-                    *iter = peek;
-                    break;
+            Bound::Excluded(b) | Bound::Included(b) => {
+                let k: &Q = k.borrow();
+                match k.cmp(b) {
+                    Ordering::Greater => (),
+                    Ordering::Equal => {
+                        *iter = peek;
+                        break;
+                    }
+                    Ordering::Less => break,
                 }
-                Ordering::Less => break,
-            },
+            }
         }
         *iter = core::mem::replace(&mut peek, peek2.clone());
     }
@@ -179,10 +182,7 @@ where
     }
 
     pub(crate) unsafe fn from_parts(reader: &'a R, root: ReadPage<'a, B, L>) -> Self {
-        Self {
-            reader,
-            root,
-        }
+        Self { reader, root }
     }
 
     /// Fetch the value for a key.
