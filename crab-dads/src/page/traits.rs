@@ -1,51 +1,27 @@
 
-use bytemuck::AnyBitPattern;
+use bytemuck::{CheckedBitPattern, NoUninit};
 use crate::Error;
-
-/// Implement for any struct that needs to be endian-swapped when read or written.
-pub trait EndianSwappable {
-    fn endian_swap(self) -> Self;
-}
-
-impl EndianSwappable for u8 {
-    fn endian_swap(self) -> Self {
-        self
-    }
-}
-
-impl EndianSwappable for u16 {
-    fn endian_swap(self) -> Self {
-        self.to_le()
-    }
-}
-
-impl EndianSwappable for u32 {
-    fn endian_swap(self) -> Self {
-        self.to_le()
-    }
-}
-
-impl EndianSwappable for u64 {
-    fn endian_swap(self) -> Self {
-        self.to_le()
-    }
-}
 
 /// Layout of key-value pairs for a page of memory.
 ///
 /// # Safety
 ///
-/// - `Info` must have an alignment of 8 bytes or fewer
+/// - The implementing struct must have an alignment of 8 bytes or fewer.
+/// - The implementing struct must be endianess-agnostic: either by only having
+///   single-byte content fields, or by performing endian conversions on read &
+///   write of fields.
 /// - The read operations cannot read more than 8 bytes beyond the end of the
 ///   provided source slices.
-pub unsafe trait PageLayout<'a>: Sized {
-    type Info: AnyBitPattern + EndianSwappable + Clone + Copy;
-    type Key: Ord + 'a;
-    type Value: 'a;
+/// - `write_key` and `write_value` must work even if the current bit pattern is
+///   incorrect.
+pub unsafe trait PageLayout: NoUninit + CheckedBitPattern + Default {
+    type Key: Ord + ?Sized;
+    type Value: ?Sized;
 
-    fn from_info(info: Self::Info) -> Self;
-
+    /// The size of the variable-length portion of the current key.
     fn key_len(&self) -> usize;
+
+    /// The size of the variable-length portion of the current value.
     fn value_len(&self) -> usize;
 
     /// Read the key out of a source slice.
@@ -55,7 +31,7 @@ pub unsafe trait PageLayout<'a>: Sized {
     /// The caller must ensure that `src` is exactly the length specified by
     /// calling [`key_len`](#method.key_len), and the 8 bytes after the end of
     /// the slice must also be valid to read from with the same pointer.
-    unsafe fn read_key(&self, src: &'a [u8]) -> Result<Self::Key, Error>;
+    unsafe fn read_key<'a>(&'a self, src: &'a [u8]) -> Result<&'a Self::Key, Error>;
 
     /// Read the value out of a source slice.
     /// 
@@ -64,49 +40,39 @@ pub unsafe trait PageLayout<'a>: Sized {
     /// The caller must ensure that `src` is exactly the length specified by
     /// calling [`value_len`](#method.value_len), and the 8 bytes after the end
     /// of the slice must also be valid to read from with the same pointer.
-    unsafe fn read_value(&self, src: &'a [u8]) -> Result<Self::Value, Error>;
+    unsafe fn read_value<'a>(&'a self, src: &'a [u8]) -> Result<&'a Self::Value, Error>;
 
-    /// Update with a new value, returning the change in how many bytes are
-    /// required to store the new value.
-    fn update_value(&mut self, new: &Self::Value) -> Result<isize, Error>;
-
-    /// Create a new layout meant to hold a provided key-value pair.
-    fn from_data(key: &Self::Key, value: &Self::Value) -> Result<Self, Error>;
-
-    /// Write an updated value to the provided destination slice.
+    /// Get mutable access to the value.
     /// 
     /// # Safety
     /// 
-    /// The caller must ensure that `dest` is exactly the length specified by
-    /// calling [`value_len`](#method.value_len), and the value must have been
-    /// previously part of the construction of this layout.
-    /// 
-    /// If `from_info` was used to construct this, then the value must
-    /// match the one retrieved with `read_value`. If `update_value` has been
-    /// called after that, that value should be used instead.
-    /// 
-    /// If `from_value` was used to construct this, then the value used
-    /// for that must also be used here.
-    unsafe fn write_value(&self, value: &Self::Value, dest: &mut [u8]);
+    /// The caller must ensure that `src` is exactly the length specified by
+    /// calling [`key_len`](#method.key_len), the 8 bytes after the end of
+    /// the slice must also be valid to read from with the same pointer.
+    unsafe fn update_value<'a>(&'a mut self, src: &'a mut [u8]) -> Result<&'a mut Self::Value, Error>;
 
-    /// Write the key-value pair to the provided destination slice.
-    /// 
+    /// Determine how many bytes are needed to store a given key.
+    fn determine_key_len(key: &Self::Key) -> Result<usize, Error>;
+
+    /// Determine how many bytes are needed to store a given value.
+    fn determine_value_len(value: &Self::Value) -> Result<usize, Error>;
+
+    /// Write out a new key.
+    ///
     /// # Safety
     /// 
-    /// The caller must ensure that `dest` is exactly the sum of the lengths
-    /// specified by calling [`key_len`](#method.key_len) and
-    /// [`value_len`](#method.value_len), and both key and value must have been
-    /// previously part of the construction of this layout.
-    /// 
-    /// If `from_info` was used to construct this, then the key and value must
-    /// match the ones retrieved with `read_key` and `read_value`. If
-    /// `update_value` has been called after that, that value should be used
-    /// instead.
-    /// 
-    /// If `from_value` was used to construct this, then the key and value used
-    /// for that must also be used here.
-    unsafe fn write_pair(&self, key: &Self::Key, value: &Self::Value, dest: &mut [u8]);
+    /// This must be called with a key that was already checked by
+    /// `determine_key_len`, and the destination must have a size that is
+    /// exactly equal to what the function returned.
+    unsafe fn write_key(&mut self, key: &Self::Key, dest: &mut [u8]);
 
-    /// Return the info data needed to recreate this layout.
-    fn info(&self) -> Self::Info;
+    /// Write out a new value.
+    ///
+    /// # Safety
+    /// 
+    /// This must be called with a value that was already checked by
+    /// `determine_value_len`, and the destination must have a size that is
+    /// exactly equal to what the function returned.
+    unsafe fn write_value(&mut self, val: &Self::Value, dest: &mut [u8]);
+
 }

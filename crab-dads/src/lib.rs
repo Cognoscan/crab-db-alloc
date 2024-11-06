@@ -1,4 +1,5 @@
 #![no_std]
+#![warn(unsafe_op_in_unsafe_fn)]
 
 extern crate alloc;
 
@@ -48,11 +49,19 @@ impl core::error::Error for StorageError {}
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
+    /// Out of space; needed at least N bytes.
     OutofSpace(usize),
+    /// Data format on disk was corrupted somehow.
     DataCorruption,
+    /// A requested write operation was too large to fit within the disk map.
     WriteTooLarge,
+    /// Storage system-related error.
     Storage(StorageError),
+    /// Expected to perform an operation like a split or rebalance, but nothing
+    /// could be done.
     UnexpectedNoOp,
+    /// Attempted to perform an invalid operation (ex. trying to resize a u64 key).
+    IncorrectOperation,
 }
 
 impl core::error::Error for Error {
@@ -72,7 +81,12 @@ impl core::fmt::Display for Error {
             Self::DataCorruption => f.write_str("Data Corruption"),
             Self::WriteTooLarge => f.write_str("Provided Key/Value is too large to fit in the map"),
             Self::Storage(_) => f.write_str("Storage system error"),
-            Self::UnexpectedNoOp => f.write_str("Expected to perform an operation (page split, page rebalance) but couldn't"),
+            Self::UnexpectedNoOp => f.write_str(
+                "Expected to perform an operation (page split, page rebalance) but couldn't",
+            ),
+            Self::IncorrectOperation => {
+                f.write_str("attempted to perform a nonsensical operation on the database")
+            }
         }
     }
 }

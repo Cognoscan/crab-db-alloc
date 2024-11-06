@@ -1,16 +1,21 @@
 use core::{iter::FusedIterator, marker::PhantomData};
 
-use bytemuck::AnyBitPattern;
+use bytemuck::CheckedBitPattern;
+
+use crate::Error;
 
 /// An array of fixed-size values that grows downward in memory.
 #[derive(Clone, Debug)]
-pub struct RevSizedArray<'a, T: AnyBitPattern> {
+pub struct RevSizedArray<'a, T: CheckedBitPattern>
+where
+    T: 'a,
+{
     front: *const T,
     back: *const T,
-    data: PhantomData<&'a [T]>
+    data: PhantomData<&'a [T]>,
 }
 
-impl<'a, T: AnyBitPattern> RevSizedArray<'a, T> {
+impl<'a, T: CheckedBitPattern> RevSizedArray<'a, T> {
     pub fn new(data: &[T]) -> Self {
         let range = data.as_ptr_range();
         Self {
@@ -22,23 +27,23 @@ impl<'a, T: AnyBitPattern> RevSizedArray<'a, T> {
 
     /// Get how many remaining bytes are in the array.
     pub fn remaining_bytes(&self) -> usize {
-        unsafe {
-            self.front.byte_offset_from(self.back) as usize
-        }
+        unsafe { self.front.byte_offset_from(self.back) as usize }
     }
-
 }
 
-impl<'a, T: AnyBitPattern> Iterator for RevSizedArray<'a, T> {
-    type Item = T;
+impl<'a, T: CheckedBitPattern> Iterator for RevSizedArray<'a, T> {
+    type Item = Result<&'a T, Error>;
 
-    fn next(&mut self) -> Option<T> {
+    fn next(&mut self) -> Option<Result<&'a T, Error>> {
         if self.front == self.back {
             return None;
         }
         unsafe {
             self.front = self.front.sub(1);
-            Some(self.front.read())
+            if !T::is_valid_bit_pattern(&*(self.front as *const T::Bits)) {
+                return Some(Err(Error::DataCorruption));
+            }
+            Some(Ok(&*(self.front as *const T)))
         }
     }
 
@@ -48,36 +53,38 @@ impl<'a, T: AnyBitPattern> Iterator for RevSizedArray<'a, T> {
     }
 }
 
-impl<'a, T: AnyBitPattern> FusedIterator for RevSizedArray<'a, T> {}
+impl<'a, T: CheckedBitPattern> FusedIterator for RevSizedArray<'a, T> {}
 
-impl<'a, T: AnyBitPattern> ExactSizeIterator for RevSizedArray<'a, T> {}
+impl<'a, T: CheckedBitPattern> ExactSizeIterator for RevSizedArray<'a, T> {}
 
-impl<'a, T: AnyBitPattern> DoubleEndedIterator for RevSizedArray<'a, T> {
-    fn next_back(&mut self) -> Option<T> {
+impl<'a, T: CheckedBitPattern> DoubleEndedIterator for RevSizedArray<'a, T> {
+    fn next_back(&mut self) -> Option<Result<&'a T, Error>> {
         if self.front == self.back {
             return None;
         }
         unsafe {
-            let ret = self.back.read();
+            if !T::is_valid_bit_pattern(&*(self.back as *const T::Bits)) {
+                return Some(Err(Error::DataCorruption));
+            }
+            let ret = &*(self.back as *const T);
             self.back = self.back.add(1);
-            Some(ret)
+            Some(Ok(ret))
         }
     }
 }
 
-
 /// An array of fixed-size values that grows downward in memory.
 #[derive(Clone, Debug)]
-pub struct RevSizedArrayMut<'a, T: AnyBitPattern> {
+pub struct RevSizedArrayMut<'a, T: CheckedBitPattern> {
     front: *mut T,
     back: *mut T,
     end: *mut T,
     prev_back: *mut T,
-    data: PhantomData<&'a mut [T] >
+    data: PhantomData<&'a mut [T]>,
 }
 
-impl<'a, T: AnyBitPattern> RevSizedArrayMut<'a, T> {
-    /// Create a new iterator over a sized array of values that grow downwards,
+impl<'a, T: CheckedBitPattern> RevSizedArrayMut<'a, T> {
+    /// Create a new iterator over a sized array of values that grow downwards.
     pub fn new(data: &mut [T]) -> Self {
         let range = data.as_mut_ptr_range();
         Self {
@@ -91,9 +98,7 @@ impl<'a, T: AnyBitPattern> RevSizedArrayMut<'a, T> {
 
     /// Get how many remaining bytes are in the array.
     pub fn remaining_bytes(&self) -> usize {
-        unsafe {
-            self.front.byte_offset_from(self.back) as usize
-        }
+        unsafe { self.front.byte_offset_from(self.back) as usize }
     }
 
     /// Delete the element that was last read from
@@ -102,7 +107,7 @@ impl<'a, T: AnyBitPattern> RevSizedArrayMut<'a, T> {
     /// # Safety
     ///
     /// [`next_back`](#method.next_back) needs to have been called and returned
-    /// `Some(T)`.
+    /// `Some(Ok(T))`.
     pub unsafe fn back_delete(self) {
         unsafe {
             core::ptr::copy(
@@ -113,44 +118,26 @@ impl<'a, T: AnyBitPattern> RevSizedArrayMut<'a, T> {
         }
     }
 
-    /// Delete all elements in the remaining iterator, including the ones just
-    /// read with [`next`](#method.next) and [`next_back`](#method.next_back).
-    /// This returns the number of elements deleted, which will always be at
-    /// least one if the safety requirements are upheld.
-    ///
-    /// # Safety
-    ///
-    /// [`next`](#method.next) needs to have called until finding a cutpoint set
-    /// to `Some(T)`, followed by calling [`next_back`](#method.next_back) until
-    /// finding the cutpoint or hitting `None`.
-    pub unsafe fn delete_range(self) -> isize {
-        let len = self.front.offset_from(self.prev_back) + 1;
-        core::ptr::copy(
-            self.end,
-            self.end.offset(len),
-            self.prev_back.offset_from(self.end) as usize,
-        );
-        len
-    }
-
-    /// Replace the element that was just read from
+    /// Get the element that was last read from
     /// [`next_back`](#method.next_back).
     ///
     /// # Safety
     ///
     /// [`next_back`](#method.next_back) needs to have been called and returned
-    /// `Some(T)`.
-    pub unsafe fn back_replace(&mut self, val: T) {
-        unsafe { self.prev_back.write(val) }
+    /// `Some(Ok(T))`.
+    pub unsafe fn get(&self) -> &T {
+        unsafe { &*(self.prev_back) }
     }
 
-    /// Replace the element that was just read from [`next`](#method.next).
+    /// Mutably get the element that was last read from
+    /// [`next_back`](#method.next_back).
     ///
     /// # Safety
     ///
-    /// [`next`](#method.next) needs to have been called and returned `Some(T)`.
-    pub unsafe fn replace(&mut self, val: T) {
-        self.front.write(val);
+    /// [`next_back`](#method.next_back) needs to have been called and returned
+    /// `Some(Ok(T))`.
+    pub unsafe fn get_mut(&mut self) -> &mut T {
+        unsafe { &mut *(self.prev_back) }
     }
 
     /// Insert an element right after the element that was just read from
@@ -163,25 +150,33 @@ impl<'a, T: AnyBitPattern> RevSizedArrayMut<'a, T> {
     /// The backing memory must have space for an additional element within its
     /// existing allocation, and [`next_back`](#method.next_back) must have been
     /// called at least once.
-    pub unsafe fn back_insert(self, val: T) {
-        core::ptr::copy(
-            self.end,
-            self.end.sub(1),
-            self.prev_back.offset_from(self.end) as usize,
-        );
-        self.prev_back.sub(1).write(val);
+    pub unsafe fn back_insert(&mut self, val: T) {
+        unsafe {
+            core::ptr::copy(
+                self.end,
+                self.end.sub(1),
+                self.prev_back.offset_from(self.end) as usize,
+            );
+            self.end = self.end.sub(1);
+            self.prev_back = self.prev_back.sub(1);
+            self.back = self.back.sub(1);
+            self.prev_back.write(val);
+        }
     }
 
     /// Get the next item in the array, from the back.
-    pub fn next_back(&mut self) -> Option<T> {
+    pub fn next_back(&mut self) -> Option<Result<&mut T, Error>> {
         self.prev_back = self.back;
         if self.front == self.back {
             return None;
         }
         unsafe {
-            let ret = self.back.read();
+            let ret = &mut *self.back;
+            if !T::is_valid_bit_pattern(&*(self.back as *const T::Bits)) {
+                return Some(Err(Error::DataCorruption));
+            }
             self.back = self.back.add(1);
-            Some(ret)
+            Some(Ok(ret))
         }
     }
 }
