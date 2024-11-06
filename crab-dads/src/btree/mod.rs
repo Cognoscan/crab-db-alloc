@@ -88,63 +88,6 @@ pub unsafe trait RawWrite: RawRead {
     unsafe fn deallocate_page(&mut self, page: u64) -> Result<(), StorageError>;
 }
 
-pub struct BTreeVarU64Mut<'a, W: RawWrite>(
-    BTreeWrite<'a, page::LayoutVarU64, page::LayoutVarU64, W>,
-);
-
-impl<'a, W: RawWrite> BTreeVarU64Mut<'a, W> {
-
-    /// Load in the root page of a tree.
-    ///
-    /// # Safety
-    ///
-    /// The provided page (and any child pages it may later navigate to) must
-    /// all not be used mutably elsewhere in the program.
-    pub unsafe fn load(writer: &'a mut W, page: u64) -> Result<(Self, Option<u64>), Error> {
-        let (s, page) = BTreeWrite::load(writer, page)?;
-        Ok((Self(s), page))
-    }
-
-    /// Get a value from the tree.
-    pub fn get(&self, key: &[u8]) -> Result<Option<u64>, Error> {
-        self.0.as_read::<page::LayoutVarU64, page::LayoutVarU64>().get(key)
-    }
-
-    /// Iterate immutably over a range of the tree.
-    pub fn range<'s, T, RB>(&'s self, range: RB) -> Result<impl Iterator<Item = Result<(&'s [u8], u64), Error>>, Error>
-    where
-        T: Ord + ?Sized,
-        &'s [u8]: Borrow<T> + Ord,
-        RB: RangeBounds<T>,
-    {
-        self.0.as_read::<page::LayoutVarU64, page::LayoutVarU64>().range(range)
-    }
-
-}
-
-pub struct BTreeVarU64<'a, R: RawRead>(BTreeRead<'a, page::LayoutVarU64, page::LayoutVarU64, R>);
-
-impl<'a, R: RawRead> BTreeVarU64<'a, R> {
-    pub unsafe fn new(reader: &'a R, page: u64) -> Result<Self, Error> {
-        unsafe { Ok(Self(BTreeRead::load(reader, page)?)) }
-    }
-
-    pub fn get(&self, key: &[u8]) -> Result<Option<u64>, Error> {
-        self.0.get(key)
-    }
-
-    pub fn range<T, RANGE>(
-        &self,
-        range: RANGE,
-    ) -> Result<impl Iterator<Item = Result<(&'a [u8], u64), Error>>, Error>
-    where
-        RANGE: RangeBounds<T>,
-        &'a [u8]: Borrow<T>,
-        T: Ord + ?Sized,
-    {
-        self.0.range(range)
-    }
-}
 
 #[cfg(test)]
 mod test {
@@ -224,16 +167,16 @@ mod test {
         }
     }
 
-    #[test]
-    fn simple_iter() {
-        let backend = FakeBackend::default();
+    //#[test]
+    //fn simple_iter() {
+    //    let backend = FakeBackend::default();
 
-        let tree = unsafe { BTreeVarU64::new(&backend, 0).unwrap() };
-        let empty: &[u8] = &[];
-        let range = tree.range(empty..&[0u8, 1u8]).unwrap();
-        for result in range {
-            let (k, v) = result.unwrap();
-            println!("k={:?}, v={}", k, v);
-        }
-    }
+    //    let tree = unsafe { BTreeVarU64::new(&backend, 0).unwrap() };
+    //    let empty: &[u8] = &[];
+    //    let range = tree.range(empty..&[0u8, 1u8]).unwrap();
+    //    for result in range {
+    //        let (k, v) = result.unwrap();
+    //        println!("k={:?}, v={}", k, v);
+    //    }
+    //}
 }

@@ -12,11 +12,12 @@ use crate::{
 
 use super::RawRead;
 
-fn trim_leaf<I, R, K, V, Q>(iter: &mut I, range: &R) -> Result<(), Error>
+fn trim_leaf<'a, I, R, K, V, Q>(iter: &'a mut I, range: &R) -> Result<(), Error>
 where
-    I: Iterator<Item = Result<(K, V), Error>> + Clone,
+    I: Iterator<Item = Result<(&'a K, &'a V), Error>> + Clone,
     R: RangeBounds<Q>,
-    K: Borrow<Q> + Ord,
+    K: Borrow<Q> + Ord + ?Sized + 'a,
+    V: ?Sized + 'a,
     Q: Ord + ?Sized,
 {
     // Trim the front
@@ -62,11 +63,12 @@ where
     Ok(())
 }
 
-fn trim_branch<I, R, K, V, Q>(iter: &mut I, range: &R) -> Result<(), Error>
+fn trim_branch<'a, I, R, K, V, Q>(iter: &'a mut I, range: &R) -> Result<(), Error>
 where
-    I: Iterator<Item = Result<(K, V), Error>> + Clone,
+    I: Iterator<Item = Result<(&'a K, &'a V), Error>> + Clone,
     R: RangeBounds<Q>,
-    K: Borrow<Q> + Ord,
+    K: Borrow<Q> + Ord + ?Sized + 'a,
+    V: ?Sized + 'a,
     Q: Ord + ?Sized,
 {
     // Trim the front.
@@ -119,55 +121,45 @@ where
 
 pub struct BTreeRead<'a, B, L, R>
 where
-    B: PageLayout<'a, Value = u64>,
-    L: PageLayout<'a, Key = B::Key>,
+    B: PageLayout<Value = u64>,
+    L: PageLayout<Key = B::Key>,
     R: RawRead,
 {
     reader: &'a R,
-    root: ReadPage<'a, B, L>,
+    root: ReadPage<B, L>,
 }
 
-pub(crate) enum ReadPage<'a, B, L>
+#[derive(Clone)]
+pub(crate) enum ReadPage<B, L>
 where
-    B: PageLayout<'a, Value = u64>,
-    L: PageLayout<'a, Key = B::Key>,
+    B: PageLayout<Value = u64>,
+    L: PageLayout<Key = B::Key>,
 {
-    Branch(PageMap<'a, B>),
-    Leaf(PageMap<'a, L>),
+    Branch(PageMap<B>),
+    Leaf(PageMap<L>),
 }
 
-impl<'a, B, L> Clone for ReadPage<'a, B, L>
+impl<B, L> ReadPage<B, L>
 where
-    B: PageLayout<'a, Value = u64>,
-    L: PageLayout<'a, Key = B::Key>,
+    B: PageLayout<Value = u64>,
+    L: PageLayout<Key = B::Key>,
 {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Branch(p) => Self::Branch(p.clone()),
-            Self::Leaf(p) => Self::Leaf(p.clone()),
-        }
-    }
-}
-
-impl<'a, B, L> ReadPage<'a, B, L>
-where
-    B: PageLayout<'a, Value = u64>,
-    L: PageLayout<'a, Key = B::Key>,
-{
-    unsafe fn try_load<R: RawRead>(reader: &'a R, page: u64) -> Result<Self, Error> {
-        let page_ptr = unsafe { reader.load_page(page)? };
-        if (page::page_type(page_ptr) & 1) == 1 {
-            Ok(ReadPage::Leaf(PageMap::from_ptr(page_ptr)?))
-        } else {
-            Ok(ReadPage::Branch(PageMap::from_ptr(page_ptr)?))
+    unsafe fn try_load<R: RawRead>(reader: &R, page: u64) -> Result<Self, Error> {
+        unsafe {
+            let page_ptr = reader.load_page(page)?;
+            if (page::page_type(page_ptr) & 1) == 1 {
+                Ok(ReadPage::Leaf(PageMap::from_ptr(page_ptr)?))
+            } else {
+                Ok(ReadPage::Branch(PageMap::from_ptr(page_ptr)?))
+            }
         }
     }
 }
 
 impl<'a, B, L, R> BTreeRead<'a, B, L, R>
 where
-    B: PageLayout<'a, Value = u64>,
-    L: PageLayout<'a, Key = B::Key>,
+    B: PageLayout<Value = u64>,
+    L: PageLayout<Key = B::Key>,
     R: RawRead,
 {
     /// Load in the root page of a tree.
@@ -177,28 +169,30 @@ where
     /// The root page must have come from either a parent tree or be the root
     /// page of the database.
     pub unsafe fn load(reader: &'a R, page: u64) -> Result<Self, Error> {
-        let root = ReadPage::try_load(reader, page)?;
-        Ok(Self { reader, root })
+        unsafe {
+            let root = ReadPage::try_load(reader, page)?;
+            Ok(Self { reader, root })
+        }
     }
 
-    pub(crate) unsafe fn from_parts(reader: &'a R, root: ReadPage<'a, B, L>) -> Self {
+    pub(crate) unsafe fn from_parts(reader: &'a R, root: ReadPage<B, L>) -> Self {
         Self { reader, root }
     }
 
     /// Fetch the value for a key.
-    pub fn get<Q>(&self, key: &Q) -> Result<Option<L::Value>, Error>
+    pub fn get<Q>(&self, key: &Q) -> Result<Option<&L::Value>, Error>
     where
         L::Key: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let mut page: ReadPage<'a, B, L> = self.root.clone();
+        let mut page: ReadPage<B, L> = self.root.clone();
         'outer: loop {
             match page {
                 ReadPage::Branch(b) => {
                     for result in b.iter().rev() {
                         let (k, v) = result?;
                         if k.borrow() <= key {
-                            page = unsafe { ReadPage::try_load(self.reader, v)? };
+                            page = unsafe { ReadPage::try_load(self.reader, *v)? };
                             continue 'outer;
                         }
                     }
@@ -209,7 +203,16 @@ where
                         let (k, v) = result?;
                         let k: &Q = k.borrow();
                         match k.cmp(key) {
-                            Ordering::Equal => return Ok(Some(v)),
+                            Ordering::Equal => {
+                                // SAFETY: We know the page holding v is valid
+                                // and immutable as long as we have the reader,
+                                // so we can extract the object directly and
+                                // give it a new lifetime.
+                                let v = unsafe {
+                                    &*(v as *const L::Value)
+                                };
+                                return Ok(Some(v));
+                            },
                             Ordering::Greater => continue,
                             Ordering::Less => return Ok(None),
                         }
@@ -269,7 +272,7 @@ where
                     left.pop_back();
                     continue;
                 };
-                break page?.1;
+                break *(page?.1);
             };
 
             let new_page = unsafe { ReadPage::try_load(self.reader, page_addr)? };
@@ -316,7 +319,7 @@ where
                     left.pop_front();
                 }
             };
-            let page_addr = page?.1;
+            let page_addr = *(page?.1);
 
             let new_page = unsafe { ReadPage::try_load(self.reader, page_addr)? };
             match new_page {
@@ -347,8 +350,8 @@ where
 
 pub struct BTreeIter<'a, B, L, R>
 where
-    B: PageLayout<'a, Value = u64>,
-    L: PageLayout<'a, Key = B::Key>,
+    B: PageLayout<Value = u64>,
+    L: PageLayout<Key = B::Key>,
     R: RawRead,
 {
     reader: &'a R,
@@ -357,8 +360,8 @@ where
 
 enum BTreeIterState<'a, B, L>
 where
-    B: PageLayout<'a, Value = u64>,
-    L: PageLayout<'a, Key = B::Key>,
+    B: PageLayout<Value = u64>,
+    L: PageLayout<Key = B::Key>,
 {
     Empty,
     Leaf(PageIter<'a, L>),
@@ -367,8 +370,8 @@ where
 
 struct BTreeIterFull<'a, B, L>
 where
-    B: PageLayout<'a, Value = u64>,
-    L: PageLayout<'a, Key = B::Key>,
+    B: PageLayout<Value = u64>,
+    L: PageLayout<Key = B::Key>,
 {
     left: VecDeque<PageIter<'a, B>>,
     right: VecDeque<PageIter<'a, B>>,
@@ -378,12 +381,12 @@ where
 
 impl<'a, B, L, R> BTreeIter<'a, B, L, R>
 where
-    B: PageLayout<'a, Value = u64> + 'a,
-    L: PageLayout<'a, Key = B::Key> + 'a,
+    B: PageLayout<Value = u64> + 'a,
+    L: PageLayout<Key = B::Key> + 'a,
     R: RawRead,
 {
     #[allow(clippy::type_complexity)]
-    fn next_internal(&mut self) -> Result<Option<(L::Key, L::Value)>, Error> {
+    fn next_internal(&mut self) -> Result<Option<(&L::Key, &L::Value)>, Error> {
         let full = match &mut self.state {
             BTreeIterState::Empty => return Ok(None),
             BTreeIterState::Leaf(l) => return l.next().transpose(),
@@ -413,7 +416,7 @@ where
                     full.right.pop_front();
                 }
             };
-            let page_addr = page?.1;
+            let page_addr = *(page?.1);
 
             let new_page = unsafe { ReadPage::try_load(self.reader, page_addr)? };
             match new_page {
@@ -429,7 +432,7 @@ where
     }
 
     #[allow(clippy::type_complexity)]
-    fn next_back_internal(&mut self) -> Result<Option<(L::Key, L::Value)>, Error> {
+    fn next_back_internal(&mut self) -> Result<Option<(&L::Key, &L::Value)>, Error> {
         let full = match &mut self.state {
             BTreeIterState::Empty => return Ok(None),
             BTreeIterState::Leaf(l) => return l.next_back().transpose(),

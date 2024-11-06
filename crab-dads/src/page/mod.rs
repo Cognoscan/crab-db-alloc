@@ -11,6 +11,10 @@ use core::{cmp::Ordering, marker::PhantomData, slice};
 
 const CONTENT_SIZE: usize = PAGE_4K - core::mem::size_of::<TwoArrayTrailer>();
 
+/// The maximum allowed variable-length size, assuming either [`LayoutU64Var`]
+/// or [`LayoutVarU64`].
+pub const MAX_VAR_SIZE: usize = 1008;
+
 use crate::{
     arrays::{KeyValArray, KeyValArrayMut, KeyValEntry, RevSizedArray, RevSizedArrayMut},
     Error, TwoArrayTrailer, PAGE_4K,
@@ -36,6 +40,7 @@ pub struct PageMap<T: PageLayout> {
 }
 
 impl<T: PageLayout> Clone for PageMap<T> {
+    /// Cloning produces a pointer to the same underlying memory, so use this with caution.
     fn clone(&self) -> Self {
         Self {
             page: self.page,
@@ -472,7 +477,7 @@ impl<T: PageLayout> PageMapMut<T> {
             while let Some(i) = info.next_back() {
                 let i = i?;
                 kv.next_pair_back(i.key_len(), i.value_len())?;
-                match i.read_key(kv.key())?.cmp(key) {
+                match i.read_key(kv.key()).cmp(key) {
                     Ordering::Equal => {
                         return Ok(Entry::Occupied(OccupiedEntry { trailer, kv, info }))
                     }
@@ -531,7 +536,7 @@ impl<'a, T: PageLayout> PageIter<'a, T> {
         let info = info?;
         let (key, val) = self.data.next_pair(info.key_len(), info.value_len())?;
         // Safety: we constructed our slices using the provided length numbers.
-        unsafe { Ok(Some((info.read_key(key)?, info.read_value(val)?))) }
+        unsafe { Ok(Some((info.read_key(key), info.read_value(val)))) }
     }
 
     #[allow(clippy::type_complexity)]
@@ -543,7 +548,7 @@ impl<'a, T: PageLayout> PageIter<'a, T> {
         let info = info?;
         let (key, val) = self.data.next_pair_back(info.key_len(), info.value_len())?;
         // Safety: we constructed our slices using the provided length numbers.
-        unsafe { Ok(Some((info.read_key(key)?, info.read_value(val)?))) }
+        unsafe { Ok(Some((info.read_key(key), info.read_value(val)))) }
     }
 }
 
@@ -581,7 +586,7 @@ impl<'a, T: PageLayout> OccupiedEntry<'a, T> {
     pub fn key(&self) -> &T::Key {
         unsafe {
             let info = self.info.get();
-            info.read_key(self.kv.key()).unwrap_unchecked()
+            info.read_key(self.kv.key())
         }
     }
 
@@ -589,7 +594,7 @@ impl<'a, T: PageLayout> OccupiedEntry<'a, T> {
     pub fn get(&self) -> &T::Value {
         unsafe {
             let info = self.info.get();
-            info.read_value(self.kv.val()).unwrap_unchecked()
+            info.read_value(self.kv.val())
         }
     }
 
@@ -597,7 +602,7 @@ impl<'a, T: PageLayout> OccupiedEntry<'a, T> {
     pub fn get_mut(&mut self) -> &mut T::Value {
         unsafe {
             let info = self.info.get_mut();
-            info.update_value(self.kv.val_mut()).unwrap_unchecked()
+            info.update_value(self.kv.val_mut())
         }
     }
 
@@ -645,7 +650,7 @@ pub struct VacantEntry<'a, 'k, T: PageLayout> {
 impl<'a, 'k, T: PageLayout> VacantEntry<'a, 'k, T> {
     /// Get the key for this vacant entry.
     pub fn key(&self) -> &T::Key {
-        unsafe { self.info.get().read_key(self.kv.key()).unwrap_unchecked() }
+        unsafe { self.info.get().read_key(self.kv.key()) }
     }
 
     /// Insert a value into this entry, transforming into an occupied entry.

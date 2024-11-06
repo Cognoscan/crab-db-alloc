@@ -31,7 +31,7 @@ pub unsafe trait PageLayout: NoUninit + CheckedBitPattern + Default {
     /// The caller must ensure that `src` is exactly the length specified by
     /// calling [`key_len`](#method.key_len), and the 8 bytes after the end of
     /// the slice must also be valid to read from with the same pointer.
-    unsafe fn read_key<'a>(&'a self, src: &'a [u8]) -> Result<&'a Self::Key, Error>;
+    unsafe fn read_key<'a>(&'a self, src: &'a [u8]) -> &'a Self::Key;
 
     /// Read the value out of a source slice.
     /// 
@@ -40,7 +40,7 @@ pub unsafe trait PageLayout: NoUninit + CheckedBitPattern + Default {
     /// The caller must ensure that `src` is exactly the length specified by
     /// calling [`value_len`](#method.value_len), and the 8 bytes after the end
     /// of the slice must also be valid to read from with the same pointer.
-    unsafe fn read_value<'a>(&'a self, src: &'a [u8]) -> Result<&'a Self::Value, Error>;
+    unsafe fn read_value<'a>(&'a self, src: &'a [u8]) -> &'a Self::Value;
 
     /// Get mutable access to the value.
     /// 
@@ -49,7 +49,7 @@ pub unsafe trait PageLayout: NoUninit + CheckedBitPattern + Default {
     /// The caller must ensure that `src` is exactly the length specified by
     /// calling [`key_len`](#method.key_len), the 8 bytes after the end of
     /// the slice must also be valid to read from with the same pointer.
-    unsafe fn update_value<'a>(&'a mut self, src: &'a mut [u8]) -> Result<&'a mut Self::Value, Error>;
+    unsafe fn update_value<'a>(&'a mut self, src: &'a mut [u8]) -> &'a mut Self::Value;
 
     /// Determine how many bytes are needed to store a given key.
     fn determine_key_len(key: &Self::Key) -> Result<usize, Error>;

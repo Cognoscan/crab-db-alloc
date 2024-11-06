@@ -22,12 +22,12 @@ unsafe impl PageLayout for LayoutU64U64 {
         8
     }
 
-    unsafe fn read_key<'a>(&'a self, src: &'a [u8]) -> Result<&'a Self::Key, Error> {
-        unsafe { Ok(&*(src.as_ptr() as *const u64)) }
+    unsafe fn read_key<'a>(&'a self, src: &'a [u8]) -> &'a Self::Key {
+        unsafe { &*(src.as_ptr() as *const u64) }
     }
 
-    unsafe fn read_value<'a>(&'a self, src: &'a [u8]) -> Result<&'a Self::Value, Error> {
-        unsafe { Ok(&*(src.as_ptr() as *const u64)) }
+    unsafe fn read_value<'a>(&'a self, src: &'a [u8]) -> &'a Self::Value {
+        unsafe { &*(src.as_ptr() as *const u64) }
     }
 
     fn determine_key_len(_: &Self::Key) -> Result<usize, Error> {
@@ -41,8 +41,8 @@ unsafe impl PageLayout for LayoutU64U64 {
     unsafe fn update_value<'a>(
         &'a mut self,
         src: &'a mut [u8],
-    ) -> Result<&'a mut Self::Value, Error> {
-        unsafe { Ok(&mut *(src.as_mut_ptr() as *mut u64)) }
+    ) -> &'a mut Self::Value {
+        unsafe { &mut *(src.as_mut_ptr() as *mut u64) }
     }
 
     unsafe fn write_key(&mut self, key: &Self::Key, dest: &mut [u8]) {
