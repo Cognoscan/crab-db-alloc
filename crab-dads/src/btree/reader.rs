@@ -12,7 +12,7 @@ use crate::{
 
 use super::RawRead;
 
-fn trim_leaf<'a, I, R, K, V, Q>(iter: &'a mut I, range: &R) -> Result<(), Error>
+fn trim_leaf<'a, I, R, K, V, Q>(iter: &mut I, range: &R) -> Result<(), Error>
 where
     I: Iterator<Item = Result<(&'a K, &'a V), Error>> + Clone,
     R: RangeBounds<Q>,
@@ -63,7 +63,7 @@ where
     Ok(())
 }
 
-fn trim_branch<'a, I, R, K, V, Q>(iter: &'a mut I, range: &R) -> Result<(), Error>
+fn trim_branch<'a, I, R, K, V, Q>(iter: &mut I, range: &R) -> Result<(), Error>
 where
     I: Iterator<Item = Result<(&'a K, &'a V), Error>> + Clone,
     R: RangeBounds<Q>,
@@ -126,31 +126,31 @@ where
     R: RawRead,
 {
     reader: &'a R,
-    root: ReadPage<B, L>,
+    root: ReadPage<'a, B, L>,
 }
 
 #[derive(Clone)]
-pub(crate) enum ReadPage<B, L>
+pub(crate) enum ReadPage<'a, B, L>
 where
     B: PageLayout<Value = u64>,
     L: PageLayout<Key = B::Key>,
 {
-    Branch(PageMap<B>),
-    Leaf(PageMap<L>),
+    Branch(PageMap<'a, B>),
+    Leaf(PageMap<'a, L>),
 }
 
-impl<B, L> ReadPage<B, L>
+impl<'a, B, L> ReadPage<'a, B, L>
 where
     B: PageLayout<Value = u64>,
     L: PageLayout<Key = B::Key>,
 {
-    unsafe fn try_load<R: RawRead>(reader: &R, page: u64) -> Result<Self, Error> {
+    unsafe fn try_load<R: RawRead>(reader: &'a R, page: u64) -> Result<Self, Error> {
         unsafe {
             let page_ptr = reader.load_page(page)?;
             if (page::page_type(page_ptr) & 1) == 1 {
-                Ok(ReadPage::Leaf(PageMap::from_ptr(page_ptr)?))
+                Ok(ReadPage::Leaf(PageMap::from_page(page_ptr)?))
             } else {
-                Ok(ReadPage::Branch(PageMap::from_ptr(page_ptr)?))
+                Ok(ReadPage::Branch(PageMap::from_page(page_ptr)?))
             }
         }
     }
@@ -175,7 +175,7 @@ where
         }
     }
 
-    pub(crate) unsafe fn from_parts(reader: &'a R, root: ReadPage<B, L>) -> Self {
+    pub(crate) unsafe fn from_parts(reader: &'a R, root: ReadPage<'a, B, L>) -> Self {
         Self { reader, root }
     }
 
@@ -386,7 +386,7 @@ where
     R: RawRead,
 {
     #[allow(clippy::type_complexity)]
-    fn next_internal(&mut self) -> Result<Option<(&L::Key, &L::Value)>, Error> {
+    fn next_internal(&mut self) -> Result<Option<(&'a L::Key, &'a L::Value)>, Error> {
         let full = match &mut self.state {
             BTreeIterState::Empty => return Ok(None),
             BTreeIterState::Leaf(l) => return l.next().transpose(),
@@ -432,7 +432,7 @@ where
     }
 
     #[allow(clippy::type_complexity)]
-    fn next_back_internal(&mut self) -> Result<Option<(&L::Key, &L::Value)>, Error> {
+    fn next_back_internal(&mut self) -> Result<Option<(&'a L::Key, &'a L::Value)>, Error> {
         let full = match &mut self.state {
             BTreeIterState::Empty => return Ok(None),
             BTreeIterState::Leaf(l) => return l.next_back().transpose(),
@@ -462,7 +462,7 @@ where
                     full.left.pop_front();
                 }
             };
-            let page_addr = page?.1;
+            let page_addr = *(page?.1);
 
             let new_page = unsafe { ReadPage::try_load(self.reader, page_addr)? };
             match new_page {
@@ -480,11 +480,11 @@ where
 
 impl<'a, B, L, R> Iterator for BTreeIter<'a, B, L, R>
 where
-    B: PageLayout<'a, Value = u64> + 'a,
-    L: PageLayout<'a, Key = B::Key> + 'a,
+    B: PageLayout<Value = u64> + 'a,
+    L: PageLayout<Key = B::Key> + 'a,
     R: RawRead,
 {
-    type Item = Result<(L::Key, L::Value), Error>;
+    type Item = Result<(&'a L::Key, &'a L::Value), Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_internal().transpose()
@@ -493,8 +493,8 @@ where
 
 impl<'a, B, L, R> DoubleEndedIterator for BTreeIter<'a, B, L, R>
 where
-    B: PageLayout<'a, Value = u64> + 'a,
-    L: PageLayout<'a, Key = B::Key> + 'a,
+    B: PageLayout<Value = u64> + 'a,
+    L: PageLayout<Key = B::Key> + 'a,
     R: RawRead,
 {
     fn next_back(&mut self) -> Option<Self::Item> {

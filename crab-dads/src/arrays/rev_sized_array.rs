@@ -73,9 +73,77 @@ impl<'a, T: CheckedBitPattern> DoubleEndedIterator for RevSizedArray<'a, T> {
     }
 }
 
-/// An array of fixed-size values that grows downward in memory.
+/// Mutable access to an array of fixed-size values that grows downward in
+/// memory.
 #[derive(Clone, Debug)]
 pub struct RevSizedArrayMut<'a, T: CheckedBitPattern> {
+    front: *mut T,
+    back: *mut T,
+    data: PhantomData<&'a mut [T]>,
+}
+
+impl<'a, T: CheckedBitPattern> RevSizedArrayMut<'a, T> {
+    pub fn new(data: &mut [T]) -> Self {
+        let range = data.as_mut_ptr_range();
+        Self {
+            front: range.end,
+            back: range.start,
+            data: PhantomData,
+        }
+    }
+
+    /// Get how many remaining bytes are in the array.
+    pub fn remaining_bytes(&self) -> usize {
+        unsafe { self.front.byte_offset_from(self.back) as usize }
+    }
+}
+
+impl<'a, T: CheckedBitPattern> Iterator for RevSizedArrayMut<'a, T> {
+    type Item = Result<&'a mut T, Error>;
+
+    fn next(&mut self) -> Option<Result<&'a mut T, Error>> {
+        if self.front == self.back {
+            return None;
+        }
+        unsafe {
+            self.front = self.front.sub(1);
+            if !T::is_valid_bit_pattern(&*(self.front as *const T::Bits)) {
+                return Some(Err(Error::DataCorruption));
+            }
+            Some(Ok(&mut *(self.front as *mut T)))
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let size = unsafe { self.front.offset_from(self.back) as usize };
+        (size, Some(size))
+    }
+}
+
+impl<'a, T: CheckedBitPattern> FusedIterator for RevSizedArrayMut<'a, T> {}
+
+impl<'a, T: CheckedBitPattern> ExactSizeIterator for RevSizedArrayMut<'a, T> {}
+
+impl<'a, T: CheckedBitPattern> DoubleEndedIterator for RevSizedArrayMut<'a, T> {
+    fn next_back(&mut self) -> Option<Result<&'a mut T, Error>> {
+        if self.front == self.back {
+            return None;
+        }
+        unsafe {
+            if !T::is_valid_bit_pattern(&*(self.back as *const T::Bits)) {
+                return Some(Err(Error::DataCorruption));
+            }
+            let ret = &mut *(self.back as *mut T);
+            self.back = self.back.add(1);
+            Some(Ok(ret))
+        }
+    }
+}
+
+/// Mutable, resizable access to an array of fixed-size values that grows
+/// downward in memory.
+#[derive(Clone, Debug)]
+pub struct RevSizedArrayMutResize<'a, T: CheckedBitPattern> {
     front: *mut T,
     back: *mut T,
     end: *mut T,
@@ -83,7 +151,7 @@ pub struct RevSizedArrayMut<'a, T: CheckedBitPattern> {
     data: PhantomData<&'a mut [T]>,
 }
 
-impl<'a, T: CheckedBitPattern> RevSizedArrayMut<'a, T> {
+impl<'a, T: CheckedBitPattern> RevSizedArrayMutResize<'a, T> {
     /// Create a new iterator over a sized array of values that grow downwards.
     pub fn new(data: &mut [T]) -> Self {
         let range = data.as_mut_ptr_range();

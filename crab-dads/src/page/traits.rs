@@ -49,7 +49,7 @@ pub unsafe trait PageLayout: NoUninit + CheckedBitPattern + Default {
     /// The caller must ensure that `src` is exactly the length specified by
     /// calling [`key_len`](#method.key_len), the 8 bytes after the end of
     /// the slice must also be valid to read from with the same pointer.
-    unsafe fn update_value<'a>(&'a mut self, src: &'a mut [u8]) -> &'a mut Self::Value;
+    unsafe fn update_value<'a>(&'a self, src: &'a mut [u8]) -> &'a mut Self::Value;
 
     /// Determine how many bytes are needed to store a given key.
     fn determine_key_len(key: &Self::Key) -> Result<usize, Error>;

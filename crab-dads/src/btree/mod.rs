@@ -5,7 +5,7 @@ use core::{borrow::Borrow, ops::RangeBounds};
 pub use reader::*;
 pub use writer::*;
 
-use crate::{page, Error, StorageError};
+use crate::{page, Error, StorageError, PAGE_4K};
 
 /// Access to a backing reader.
 /// 
@@ -33,16 +33,16 @@ pub unsafe trait RawRead {
     ///
     /// Only pages reachable through reading other pages with `load_page` or the
     /// root database page may be loaded with this function.
-    unsafe fn load_page(&self, page: u64) -> Result<*const u8, StorageError>;
+    unsafe fn load_page(&self, page: u64) -> Result<&[u8; PAGE_4K], StorageError>;
 }
 
-pub enum LoadMut {
+pub enum LoadMut<'a> {
     Clean {
-        write: *mut u8,
+        write: &'a mut [u8; PAGE_4K],
         write_page: u64,
-        read: *const u8,
+        read: &'a [u8; PAGE_4K],
     },
-    Dirty(*mut u8),
+    Dirty(&'a mut [u8; PAGE_4K]),
 }
 
 /// Implements the writeable portion of a page-backed database.
@@ -74,10 +74,10 @@ pub unsafe trait RawWrite: RawRead {
     ///
     /// Only pages reachable through reading other pages with `load_page_mut` or
     /// the root database page may be loaded with this function.
-    unsafe fn load_page_mut(&mut self, page: u64) -> Result<LoadMut, StorageError>;
+    unsafe fn load_page_mut(&self, page: u64) -> Result<LoadMut, StorageError>;
 
     /// Allocate a page for writing.
-    fn allocate_page(&mut self) -> Result<(*mut u8, u64), StorageError>;
+    fn allocate_page(&self) -> Result<(&[u8; 4096], u64), StorageError>;
 
     /// Deallocate a page previously allocated by `load_mut` or `allocate`.
     ///
@@ -85,7 +85,7 @@ pub unsafe trait RawWrite: RawRead {
     ///
     /// This must only be called with page numbers that were allocated, and can
     /// only be called with them once.
-    unsafe fn deallocate_page(&mut self, page: u64) -> Result<(), StorageError>;
+    unsafe fn deallocate_page(&self, page: u64) -> Result<(), StorageError>;
 }
 
 

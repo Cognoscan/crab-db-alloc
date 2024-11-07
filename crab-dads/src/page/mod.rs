@@ -16,7 +16,7 @@ const CONTENT_SIZE: usize = PAGE_4K - core::mem::size_of::<TwoArrayTrailer>();
 pub const MAX_VAR_SIZE: usize = 1008;
 
 use crate::{
-    arrays::{KeyValArray, KeyValArrayMut, KeyValEntry, RevSizedArray, RevSizedArrayMut},
+    arrays::{KeyValArray, KeyValArrayMut, KeyValArrayMutResize, RevSizedArray, RevSizedArrayMutResize},
     Error, TwoArrayTrailer, PAGE_4K,
 };
 
@@ -25,21 +25,21 @@ struct Cutpoint {
     upper_bytes: usize,
 }
 
-pub enum Balance<T: PageLayout> {
-    Merged(PageMapMut<T>),
+pub enum Balance<'a, 'b, T: PageLayout> {
+    Merged(PageMapMut<'a, T>),
     Balanced {
-        lower: PageMapMut<T>,
-        higher: PageMapMut<T>,
+        lower: PageMapMut<'a, T>,
+        higher: PageMapMut<'b, T>,
     },
 }
 
 #[repr(transparent)]
-pub struct PageMap<T: PageLayout> {
-    layout: PhantomData<T>,
+pub struct PageMap<'a, T: PageLayout> {
+    layout: PhantomData<&'a T>,
     page: *const u8,
 }
 
-impl<T: PageLayout> Clone for PageMap<T> {
+impl<'a, T: PageLayout> Clone for PageMap<'a, T> {
     /// Cloning produces a pointer to the same underlying memory, so use this with caution.
     fn clone(&self) -> Self {
         Self {
@@ -49,15 +49,11 @@ impl<T: PageLayout> Clone for PageMap<T> {
     }
 }
 
-impl<T: PageLayout> PageMap<T> {
-    /// Convert a pointer to a page into a PageMap.
-    ///
-    /// # Safety
-    ///
-    /// This must point to a 4 kiB page.
-    pub unsafe fn from_ptr(page: *const u8) -> Result<Self, Error> {
+impl<'a, T: PageLayout> PageMap<'a, T> {
+    /// Convert a page into a PageMap
+    pub fn from_page(page: &'a [u8; PAGE_4K]) -> Result<Self, Error> {
         let ret = Self {
-            page,
+            page: page.as_ptr(),
             layout: PhantomData,
         };
         let trailer = ret.page_trailer();
@@ -65,26 +61,13 @@ impl<T: PageLayout> PageMap<T> {
         Ok(ret)
     }
 
-    /// Convert a pointer to a page into a PageMap without even the most basic
-    /// checks.
-    ///
-    /// # Safety
-    ///
-    /// This must point to a 4 kiB page with valid length information.
-    pub unsafe fn from_ptr_unchecked(page: *const u8) -> Self {
-        Self {
-            page,
-            layout: PhantomData,
-        }
-    }
-
     /// Get the trailer data for this map.
-    pub fn page_trailer(&self) -> &TwoArrayTrailer {
+    pub fn page_trailer(&self) -> &'a TwoArrayTrailer {
         unsafe { &*(self.page.byte_add(CONTENT_SIZE) as *const TwoArrayTrailer) }
     }
 
     /// Iterate over the data within the map.
-    pub fn iter(&self) -> PageIter<T> {
+    pub fn iter(&self) -> PageIter<'a, T> {
         unsafe {
             let lengths = self.page_trailer().lengths_unchecked();
             let data = KeyValArray::new(slice::from_raw_parts(self.page, lengths.lower));
@@ -101,19 +84,19 @@ impl<T: PageLayout> PageMap<T> {
     /// # Safety
     ///
     /// Destination must be valid 4 kiB page.
-    pub unsafe fn copy_to(&self, dst: *mut u8) -> PageMapMut<T> {
+    pub unsafe fn copy_to<'b>(&self, dst: &'b mut [u8; PAGE_4K]) -> PageMapMut<'b, T> {
         unsafe {
             let lengths = self.page_trailer().lengths_unchecked();
-            core::ptr::copy_nonoverlapping(self.page, dst, lengths.lower);
+            core::ptr::copy_nonoverlapping(self.page, dst.as_mut_ptr(), lengths.lower);
             let upper_bytes = lengths.upper_bytes::<T>() + core::mem::size_of::<TwoArrayTrailer>();
             let upper_offset = CONTENT_SIZE - upper_bytes;
             core::ptr::copy_nonoverlapping(
                 self.page.add(upper_offset),
-                dst.add(upper_offset),
+                dst.as_mut_ptr().add(upper_offset),
                 upper_bytes,
             );
             PageMapMut {
-                page: dst,
+                page: dst.as_mut_ptr(),
                 layout: PhantomData,
             }
         }
@@ -121,30 +104,22 @@ impl<T: PageLayout> PageMap<T> {
 }
 
 /// Get a page's type byte.
-///
-/// # Safety
-///
-/// Must point to a 4 kiB page.
-pub unsafe fn page_type(page: *const u8) -> u8 {
-    let trailer = unsafe { &*(page.byte_add(CONTENT_SIZE) as *const TwoArrayTrailer) };
+pub unsafe fn page_type(page: &[u8; PAGE_4K]) -> u8 {
+    let trailer = unsafe { &*(page.as_ptr().byte_add(CONTENT_SIZE) as *const TwoArrayTrailer) };
     trailer.page_type
 }
 
 #[repr(transparent)]
-pub struct PageMapMut<T: PageLayout> {
-    layout: PhantomData<T>,
+pub struct PageMapMut<'a, T: PageLayout> {
+    layout: PhantomData<&'a mut T>,
     page: *mut u8,
 }
 
-impl<T: PageLayout> PageMapMut<T> {
+impl<'a, T: PageLayout> PageMapMut<'a, T> {
     /// Construct a new, empty map from a 4 kiB page.
-    ///
-    /// # Safety
-    ///
-    /// This must point to a 4 kiB page.
-    pub unsafe fn new(page: *mut u8, page_type: u8) -> Self {
+    pub fn new(page: &'a mut [u8; 4096], page_type: u8) -> Self {
         let mut ret = Self {
-            page,
+            page: page.as_mut_ptr(),
             layout: PhantomData,
         };
         let trailer = ret.page_trailer_mut();
@@ -154,36 +129,15 @@ impl<T: PageLayout> PageMapMut<T> {
         ret
     }
 
-    /// Get the pointer to this page.
-    pub fn as_ptr(&self) -> *mut u8 {
-        self.page
-    }
-
-    /// Convert a pointer to a page into a `PageMapMut`.
-    ///
-    /// # Safety
-    ///
-    /// This must point to a 4 kiB page.
-    pub unsafe fn from_ptr(page: *mut u8) -> Result<Self, Error> {
-        let ret = Self {
-            page,
+    /// Convert a page into a `PageMapMut`.
+    pub fn from_page(page: &'a mut [u8; 4096]) -> Result<Self, Error> {
+        let mut ret = Self {
+            page: page.as_mut_ptr(),
             layout: PhantomData,
         };
-        let trailer = ret.as_const().page_trailer();
+        let trailer = ret.page_trailer_mut();
         trailer.lengths::<u8, T>(CONTENT_SIZE)?;
         Ok(ret)
-    }
-
-    /// Convert a pointer to a page into a `PageMapMut`.
-    ///
-    /// # Safety
-    ///
-    /// This must point to a 4 kiB page with valid length information.
-    pub unsafe fn from_ptr_unchecked(page: *mut u8) -> Self {
-        Self {
-            page,
-            layout: PhantomData,
-        }
     }
 
     /// Borrow for immutable use
@@ -246,14 +200,17 @@ impl<T: PageLayout> PageMapMut<T> {
     /// # Safety
     ///
     /// `page` must be a 4 kiB page that isn't this page.
-    pub unsafe fn split_to(&mut self, page: *mut u8) -> Result<Self, Error> {
+    pub unsafe fn split_to<'b>(
+        &mut self,
+        page: &'b mut [u8; 4096],
+    ) -> Result<PageMapMut<'b, T>, Error> {
         let trailer = self.page_trailer_mut();
         let page_type = trailer.page_type;
 
         unsafe {
             let lengths = trailer.lengths_unchecked();
 
-            let mut new_page = Self::new(page, page_type);
+            let mut new_page = PageMapMut::new(page, page_type);
 
             // Find the point at which we'll split the page
             let total_len = lengths.total::<u8, T>();
@@ -295,7 +252,10 @@ impl<T: PageLayout> PageMapMut<T> {
     /// The upper page *must* have its first key be higher than any key in this
     /// page. If these pages are all constructed using `split_to`, then this
     /// should be easy to maintain by keeping them ordered by first key.
-    pub unsafe fn balance(mut self, mut higher: Self) -> Result<Balance<T>, Error> {
+    pub unsafe fn balance<'b>(
+        mut self,
+        mut higher: PageMapMut<'b, T>,
+    ) -> Result<Balance<'a, 'b, T>, Error> {
         unsafe {
             let self_len = self.data_len();
             let higher_len = higher.data_len();
@@ -453,8 +413,21 @@ impl<T: PageLayout> PageMapMut<T> {
         lengths.total::<u8, T>()
     }
 
+    /// Iterate over the data within the map, with mutable access to the values.
+    pub fn iter_mut(&mut self) -> PageIterMut<'a, T> {
+        unsafe {
+            let lengths = self.page_trailer_mut().lengths_unchecked();
+            let data = KeyValArrayMut::new(slice::from_raw_parts_mut(self.page, lengths.lower));
+            let info = RevSizedArray::new(slice::from_raw_parts(
+                self.page.add(CONTENT_SIZE - lengths.upper_bytes::<T>()) as *const T,
+                lengths.upper,
+            ));
+            PageIterMut { info, data }
+        }
+    }
+
     /// Get an entry in the page.
-    pub fn entry<'a, 'k>(&'a mut self, key: &'k T::Key) -> Result<Entry<'a, 'k, T>, Error> {
+    pub fn entry<'k>(&mut self, key: &'k T::Key) -> Result<Entry<'a, 'k, T>, Error> {
         unsafe {
             // Extract the trailer and info inside it
             let trailer = &mut *(self
@@ -464,7 +437,7 @@ impl<T: PageLayout> PageMapMut<T> {
             let lengths = trailer.lengths_unchecked();
 
             // Construct the two array iterators
-            let mut kv = crate::arrays::KeyValArrayMut::new(slice::from_raw_parts_mut(
+            let mut kv = crate::arrays::KeyValArrayMutResize::new(slice::from_raw_parts_mut(
                 self.page,
                 lengths.lower,
             ));
@@ -472,7 +445,7 @@ impl<T: PageLayout> PageMapMut<T> {
                 self.page.add(CONTENT_SIZE - lengths.upper_bytes::<T>()) as *mut T,
                 lengths.upper,
             );
-            let mut info = crate::arrays::RevSizedArrayMut::new(info);
+            let mut info = crate::arrays::RevSizedArrayMutResize::new(info);
 
             while let Some(i) = info.next_back() {
                 let i = i?;
@@ -569,6 +542,63 @@ impl<'a, T: PageLayout> DoubleEndedIterator for PageIter<'a, T> {
     }
 }
 
+struct PageIterMut<'a, T: PageLayout> {
+    info: RevSizedArray<'a, T>,
+    data: KeyValArrayMut<'a>,
+}
+
+impl<'a, T: PageLayout> PageIterMut<'a, T> {
+    #[allow(clippy::type_complexity)]
+    fn next_internal(&mut self) -> Result<Option<(&'a T::Key, &'a mut T::Value)>, Error> {
+        let Some(info) = self.info.next() else {
+            self.data.next_none()?;
+            return Ok(None);
+        };
+        let info = info?;
+        let (raw_key, raw_val) = self.data.next_pair(info.key_len(), info.value_len())?;
+        // Safety: we constructed our slices using the provided length numbers.
+        unsafe {
+            let key = info.read_key(raw_key);
+            let val = info.update_value(raw_val);
+            Ok(Some((key, val)))
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn next_back_internal(&mut self) -> Result<Option<(&'a T::Key, &'a mut T::Value)>, Error> {
+        let Some(info) = self.info.next_back() else {
+            self.data.next_none()?;
+            return Ok(None);
+        };
+        let info = info?;
+        let (raw_key, raw_val) = self.data.next_pair_back(info.key_len(), info.value_len())?;
+        // Safety: we constructed our slices using the provided length numbers.
+        unsafe {
+            let key = info.read_key(raw_key);
+            let val = info.update_value(raw_val);
+            Ok(Some((key, val)))
+        }
+    }
+}
+
+impl<'a, T: PageLayout> Iterator for PageIterMut<'a, T> {
+    type Item = Result<(&'a T::Key, &'a mut T::Value), Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_internal().transpose()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.info.len() + 1))
+    }
+}
+
+impl<'a, T: PageLayout> DoubleEndedIterator for PageIterMut<'a, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.next_back_internal().transpose()
+    }
+}
+
 pub enum Entry<'a, 'k, T: PageLayout> {
     Occupied(OccupiedEntry<'a, T>),
     Vacant(VacantEntry<'a, 'k, T>),
@@ -576,9 +606,9 @@ pub enum Entry<'a, 'k, T: PageLayout> {
 
 /// An occupied entry in the map, ready to be inspected and modified.
 pub struct OccupiedEntry<'a, T: PageLayout> {
-    info: RevSizedArrayMut<'a, T>,
+    info: RevSizedArrayMutResize<'a, T>,
     trailer: &'a mut TwoArrayTrailer,
-    kv: KeyValArrayMut<'a>,
+    kv: KeyValArrayMutResize<'a>,
 }
 
 impl<'a, T: PageLayout> OccupiedEntry<'a, T> {
@@ -641,9 +671,9 @@ impl<'a, T: PageLayout> OccupiedEntry<'a, T> {
 
 /// An empty entry in the map, ready to be filled.
 pub struct VacantEntry<'a, 'k, T: PageLayout> {
-    info: RevSizedArrayMut<'a, T>,
+    info: RevSizedArrayMutResize<'a, T>,
     trailer: &'a mut TwoArrayTrailer,
-    kv: KeyValArrayMut<'a>,
+    kv: KeyValArrayMutResize<'a>,
     key: &'k T::Key,
 }
 

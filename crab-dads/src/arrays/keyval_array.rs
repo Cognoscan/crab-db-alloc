@@ -86,9 +86,95 @@ impl<'a> KeyValArray<'a> {
     }
 }
 
-/// An array of variable-size key-value pairs that grows upward in memory.
+/// Mutable value access to an array of variable-size key-value pairs that grows
+/// upward in memory.
 #[derive(Clone, Debug)]
 pub struct KeyValArrayMut<'a> {
+    front: *mut u8,
+    back: *mut u8,
+    data: PhantomData<&'a mut [u8]>
+}
+
+impl<'a> KeyValArrayMut<'a> {
+    pub fn new(data: &mut [u8]) -> Self {
+        let range = data.as_mut_ptr_range();
+        Self {
+            front: range.start,
+            back: range.end,
+            data: PhantomData
+        }
+    }
+
+    /// Get how many bytes are still held inside this array
+    pub fn remaining_bytes(&self) -> usize {
+        unsafe { self.back.offset_from(self.front) as usize }
+    }
+
+    /// Try to increment the front to the next key-value pair, failing if the
+    /// result pushes us past the end pointer. This returns the key and value as
+    /// slices on success.
+    pub fn next_pair(
+        &mut self,
+        key_size: usize,
+        val_size: usize,
+    ) -> Result<(&'a [u8], &'a mut [u8]), Error> {
+        let val_ptr = self.front.wrapping_add(key_size);
+        let new_front = val_ptr.wrapping_add(val_size);
+        if new_front > self.back {
+            return Err(Error::DataCorruption);
+        }
+
+        let ret = unsafe {
+            (
+                slice::from_raw_parts(self.front, key_size),
+                slice::from_raw_parts_mut(val_ptr, val_size),
+            )
+        };
+        self.front = new_front;
+        Ok(ret)
+    }
+
+    /// Try to decrement the end to the next key-value, failing if the result
+    /// pushes us past the start pointer. This returns the key and value as
+    /// slices on success.
+    pub fn next_pair_back(
+        &mut self,
+        key_size: usize,
+        val_size: usize,
+    ) -> Result<(&'a [u8], &'a mut [u8]), Error> {
+        let val_ptr = self.back.wrapping_sub(val_size);
+        let new_back = val_ptr.wrapping_sub(key_size);
+        if new_back < self.front {
+            return Err(Error::DataCorruption);
+        }
+
+        let ret = unsafe {
+            (
+                slice::from_raw_parts(new_back, key_size),
+                slice::from_raw_parts_mut(val_ptr, val_size),
+            )
+        };
+        self.back = new_back;
+        Ok(ret)
+    }
+
+    /// Update the internal pointers to mimic the outcome of getting a `None`
+    /// result from iterating. This returns an error if our iterator isn't
+    /// actually exhausted.
+    pub fn next_none(&mut self) -> Result<(), Error> {
+        if self.back != self.front {
+            return Err(Error::DataCorruption);
+        }
+        Ok(())
+    }
+
+
+}
+
+/// A mutable, resizable array of variable-size key-value pairs that grows
+/// upward in memory.
+#[derive(Clone, Debug)]
+pub struct KeyValArrayMutResize<'a> {
     // These pointers are ordered from lowest memory point to highest.
     front: *mut u8,
     back: *mut u8,
@@ -98,7 +184,7 @@ pub struct KeyValArrayMut<'a> {
     data: PhantomData<&'a mut [u8]>,
 }
 
-impl<'a> KeyValArrayMut<'a> {
+impl<'a> KeyValArrayMutResize<'a> {
     /// Create a new iterator over an array of variable-length key-value pairs.
     pub fn new(data: &mut [u8]) -> Self {
         let range = data.as_mut_ptr_range();

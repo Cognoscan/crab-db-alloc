@@ -58,7 +58,7 @@ unsafe impl PageLayout for LayoutU64Var {
     }
 
     unsafe fn update_value<'a>(
-        &'a mut self,
+        &'a self,
         src: &'a mut [u8],
     ) -> &'a mut Self::Value {
         unsafe { src.get_unchecked_mut(0..(self.len as usize)) }

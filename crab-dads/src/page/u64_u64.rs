@@ -39,7 +39,7 @@ unsafe impl PageLayout for LayoutU64U64 {
     }
 
     unsafe fn update_value<'a>(
-        &'a mut self,
+        &'a self,
         src: &'a mut [u8],
     ) -> &'a mut Self::Value {
         unsafe { &mut *(src.as_mut_ptr() as *mut u64) }
