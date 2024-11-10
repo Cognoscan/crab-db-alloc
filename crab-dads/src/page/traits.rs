@@ -7,9 +7,6 @@ use crate::Error;
 /// # Safety
 ///
 /// - The implementing struct must have an alignment of 8 bytes or fewer.
-/// - The implementing struct must be endianess-agnostic: either by only having
-///   single-byte content fields, or by performing endian conversions on read &
-///   write of fields.
 /// - The read operations cannot read more than 8 bytes beyond the end of the
 ///   provided source slices.
 /// - `write_key` and `write_value` must work even if the current bit pattern is
@@ -64,7 +61,7 @@ pub unsafe trait PageLayout: NoUninit + CheckedBitPattern + Default {
     /// This must be called with a key that was already checked by
     /// `determine_key_len`, and the destination must have a size that is
     /// exactly equal to what the function returned.
-    unsafe fn write_key(&mut self, key: &Self::Key, dest: &mut [u8]);
+    unsafe fn write_key(&mut self, key: &Self::Key, dst: &mut [u8]);
 
     /// Write out a new value.
     ///
@@ -73,6 +70,21 @@ pub unsafe trait PageLayout: NoUninit + CheckedBitPattern + Default {
     /// This must be called with a value that was already checked by
     /// `determine_value_len`, and the destination must have a size that is
     /// exactly equal to what the function returned.
-    unsafe fn write_value(&mut self, val: &Self::Value, dest: &mut [u8]);
+    unsafe fn write_value(&mut self, val: &Self::Value, dst: &mut [u8]);
 
+}
+
+pub trait PageLayoutVectored: PageLayout {
+
+    /// Determine how many bytes are needed to store a vector of values.
+    fn determine_value_len_vectored(value: &[&Self::Value]) -> Result<usize, Error>;
+
+    /// Write out a new single value from a vector of values.
+    /// 
+    /// # Safety
+    /// 
+    /// This must be called with a vector of values that was already checked by
+    /// `determine_value_len_vectored`, and the destination must have a size
+    /// that is exactly equal to what the function returned.
+    unsafe fn write_value_vectored(&mut self, val: &[&Self::Value], dst: &mut [u8]);
 }
