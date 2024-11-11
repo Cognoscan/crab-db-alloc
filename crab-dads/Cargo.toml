@@ -5,4 +5,4 @@ edition = "2021"
 rust-version = "1.81"
 
 [dependencies]
-bytemuck = "1"
+bytemuck = { version = "1", features = ["derive"] }

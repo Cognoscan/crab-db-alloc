@@ -19,7 +19,7 @@ pub const MAX_VAR_SIZE: usize = 1008;
 
 use crate::{
     arrays::{
-        KeyValArray, KeyValArrayMut, KeyValArrayMutResize, RevSizedArray, RevSizedArrayMutResize,
+        KeyValArrayMut, KeyValArrayMutResize, RevSizedArray, RevSizedArrayMutResize,
     },
     Error, TwoArrayTrailer, PAGE_4K,
 };
@@ -368,7 +368,7 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
     }
 
     /// Get an entry in the page.
-    pub fn entry<'k>(mut self, key: &'k T::Key) -> Result<Entry<'a, 'k, T>, Error> {
+    pub fn entry<'k>(self, key: &'k T::Key) -> Result<Entry<'a, 'k, T>, Error> {
         unsafe {
             // Extract the trailer and info inside it
             let trailer = &mut *(self
@@ -400,7 +400,7 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                             info,
                         }))
                     }
-                    Ordering::Greater => {
+                    Ordering::Less => {
                         return Ok(Entry::Vacant(VacantEntry {
                             page: self.page,
                             trailer,
@@ -409,7 +409,7 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                             key,
                         }))
                     }
-                    Ordering::Less => (),
+                    Ordering::Greater => (),
                 }
             }
             kv.next_pair_back_none()?;
@@ -623,15 +623,21 @@ impl<'a, 'k, T: PageLayout> VacantEntry<'a, 'k, T> {
     }
 
     /// Insert a value into this entry, transforming into an occupied entry.
-    pub fn insert(mut self, value: &T::Value) -> Result<OccupiedEntry<'a, T>, Error> {
+    pub fn insert(mut self, value: &T::Value) -> Result<OccupiedEntry<'a, T>, (Self, Error)> {
         // Length calculations and checking
-        let key_len = T::determine_key_len(self.key)?;
-        let val_len = T::determine_value_len(value)?;
+        let key_len = match T::determine_key_len(self.key) {
+            Ok(len) => len,
+            Err(e) => return Err((self, e)),
+        };
+        let val_len = match T::determine_value_len(value) {
+            Ok(len) => len,
+            Err(e) => return Err((self, e)),
+        };
         let total_len = unsafe { self.trailer.lengths_unchecked().total::<u8, T>() };
         let free = CONTENT_SIZE - total_len;
         let needed = key_len + val_len + core::mem::size_of::<T>();
         if needed < free {
-            return Err(Error::OutofSpace(needed));
+            return Err((self, Error::OutofSpace(needed)));
         }
 
         unsafe {
@@ -661,5 +667,48 @@ impl<'a, 'k, T: PageLayout> VacantEntry<'a, 'k, T> {
             layout: PhantomData,
             page: self.page,
         }
+    }
+}
+
+impl<'a, 'k, T> VacantEntry<'a, 'k, T>
+where
+    T: PageLayoutVectored,
+{
+    pub fn insert_vectored(mut self, value: &[&T::Value]) -> Result<OccupiedEntry<'a, T>, (Self, Error)> {
+        // Length calculations and checking
+        let key_len = match T::determine_key_len(self.key) {
+            Ok(len) => len,
+            Err(e) => return Err((self, e)),
+        };
+        let val_len = match T::determine_value_len_vectored(value) {
+            Ok(len) => len,
+            Err(e) => return Err((self, e)),
+        };
+        let total_len = unsafe { self.trailer.lengths_unchecked().total::<u8, T>() };
+        let free = CONTENT_SIZE - total_len;
+        let needed = key_len + val_len + core::mem::size_of::<T>();
+        if needed < free {
+            return Err((self, Error::OutofSpace(needed)));
+        }
+
+        unsafe {
+            // Create the key-value allocation and initialize the info.
+            self.kv.back_insert(key_len, val_len);
+            self.trailer.add_to_lower_len((key_len + val_len) as isize);
+            self.trailer.add_to_upper_len(1);
+            self.info.back_insert(T::default());
+
+            // Write out our key and value.
+            let info = self.info.get_mut();
+            info.write_key(self.key, self.kv.key_mut());
+            info.write_value_vectored(value, self.kv.val_mut());
+        }
+
+        Ok(OccupiedEntry {
+            page: self.page,
+            info: self.info,
+            trailer: self.trailer,
+            kv: self.kv,
+        })
     }
 }

@@ -205,7 +205,7 @@ impl<'a> KeyValArrayMutResize<'a> {
 
     /// Try to decrement the end to the next key-value, failing if the result
     /// pushes us past the start pointer.
-    pub fn next_pair_back<'s>(&'s mut self, key_size: usize, val_size: usize) -> Result<(), Error> {
+    pub fn next_pair_back(&mut self, key_size: usize, val_size: usize) -> Result<(), Error> {
         self.prev_back_key = self.back;
         let val_ptr = self.back.wrapping_sub(val_size);
         let new_back = val_ptr.wrapping_sub(key_size);
@@ -242,7 +242,7 @@ impl<'a> KeyValArrayMutResize<'a> {
     ///
     /// The backing memory must have space for the additional pair within its
     /// existing allocation.
-    pub unsafe fn back_insert<'s>(&'s mut self, key_size: usize, val_size: usize) {
+    pub unsafe fn back_insert(&mut self, key_size: usize, val_size: usize) {
         unsafe {
             let pair_size = key_size + val_size;
             // Make room

@@ -100,15 +100,6 @@ pub unsafe trait RawWrite: RawRead {
     /// multiple views into a mutable memory region.
     unsafe fn load_mut(&self, page: u64, num_pages: usize) -> Result<LoadMut, StorageError>;
 
-    /// Unload a memory region that was loaded with `load_mut`.
-    ///
-    /// # Safety
-    ///
-    /// The provided region info must have come via `load_mut`, but should use
-    /// the returned `write` page's number, which may not be the page number
-    /// provided to `load_mut`.
-    unsafe fn unload_mut(&self, page: u64, num_pages: usize);
-
     /// Allocate a memory region for writing.
     fn allocate(&self, num_pages: usize) -> Result<(&mut [u8], u64), StorageError>;
 
@@ -150,19 +141,6 @@ pub unsafe trait RawWrite: RawRead {
         }
     }
 
-    /// Unload a page that was loaded with `load_mut_page`.
-    ///
-    /// # Safety
-    ///
-    /// The provided page info must have come via `load_mut_page`, but should
-    /// use the returned `write` page's number, which may not be the page number
-    /// provided to `load_mut_page`.
-    unsafe fn unload_mut_page(&self, page: u64) {
-        unsafe {
-            self.unload_mut(page, 1);
-        }
-    }
-
     /// Allocate a page for writing.
     fn allocate_page(&self) -> Result<(&mut [u8; 4096], u64), StorageError> {
         unsafe {
@@ -183,6 +161,299 @@ pub unsafe trait RawWrite: RawRead {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 mod test {
     extern crate std;
+    use core::{alloc::GlobalAlloc, cell::UnsafeCell};
+    use std::prelude::rust_2021::*;
+    use std::sync::RwLock;
+
+    use std::vec;
+    use std::dbg;
+
+    use alloc::{collections::{btree_map::BTreeMap, vec_deque::VecDeque}, sync::Arc};
+
+    use crate::{
+        page::{LayoutU64U64, LayoutU64Var, PageMapMut},
+        Error,
+    };
+
+    use super::*;
+
+    struct BasicDbInner {
+        root: u64,
+        memory: BTreeMap<u64, Box<[u8]>>,
+        checkouts: Vec<(u64, u64)>,
+        commit: u64,
+    }
+
+    struct BasicDbRead {
+        inner: Arc<RwLock<BasicDbInner>>,
+        root: u64,
+        commit: u64,
+    }
+
+    impl Clone for BasicDbRead {
+        fn clone(&self) -> Self {
+            let mut inner = self.inner.write().unwrap();
+
+            let commit = inner.commit;
+            let co = inner.checkouts.iter_mut().rev().find(|(c, _)| c == &commit);
+            if let Some(co) = co {
+                co.1 += 1;
+            } else {
+                inner.checkouts.push((commit, 1));
+            }
+            let root = inner.root;
+
+            Self {
+                inner: self.inner.clone(),
+                root,
+                commit,
+            }
+        }
+    }
+
+    impl BasicDbRead {
+        pub fn reload(self) -> Self {
+            let new = self.clone();
+            drop(self);
+            new
+        }
+
+        pub fn tree(&self) -> Result<BTreeRead<'_, LayoutU64U64, LayoutU64Var, Self>, Error> {
+            unsafe { BTreeRead::load(self, self.root) }
+        }
+    }
+
+    unsafe impl RawRead for BasicDbRead {
+        unsafe fn load(&self, page: u64, num_pages: usize) -> Result<&[u8], StorageError> {
+            let inner = self.inner.read().unwrap();
+            let mem = inner
+                .memory
+                .get(&page)
+                .ok_or(StorageError::OutOfRange(page))?;
+            if mem.len() != (num_pages * PAGE_4K) {
+                return Err(StorageError::Corruption(
+                    "Incorrect size for the requested page",
+                ));
+            }
+            // We pinky-promised that we won't drop this memory until this
+            // reader's checkout advances (or it is dropped)
+            unsafe { Ok(core::slice::from_raw_parts(mem.as_ptr(), mem.len())) }
+        }
+    }
+
+    impl Drop for BasicDbRead {
+        fn drop(&mut self) {
+            let mut inner = self.inner.write().unwrap();
+
+            let old_co = inner
+                .checkouts
+                .iter_mut()
+                .position(|(c, _)| c == &self.commit)
+                .unwrap();
+            inner.checkouts[old_co].1 -= 1;
+            if inner.checkouts[old_co].1 == 0 {
+                inner.checkouts.remove(old_co);
+            }
+        }
+    }
+
+    fn alloc_paged(pages: usize) -> Box<[u8]> {
+        unsafe {
+            let len = PAGE_4K * pages;
+            let ptr =
+                std::alloc::alloc(core::alloc::Layout::from_size_align_unchecked(len, PAGE_4K));
+            Box::from_raw(core::ptr::slice_from_raw_parts_mut(ptr, len))
+        }
+    }
+
+    fn new_db() -> (BasicDbRead, BasicDbWrite) {
+        let mut memory = BTreeMap::new();
+        let mut mem = alloc_paged(1);
+        PageMapMut::<LayoutU64Var>::new(unsafe { &mut *(mem.as_mut_ptr() as *mut [u8; 4096]) }, 1);
+        memory.insert(0, mem);
+
+        let inner = Arc::new(RwLock::new(BasicDbInner {
+            root: 0,
+            memory,
+            checkouts: vec![(0, 1)],
+            commit: 0,
+        }));
+        let read = BasicDbRead {
+            inner: inner.clone(),
+            root: 0,
+            commit: 0,
+        };
+
+        let write = BasicDbWrite {
+            inner,
+            cell: UnsafeCell::new(BasicDbWriteCell {
+                dirty: BTreeMap::new(),
+                to_drop: VecDeque::new(),
+                page_num: 1,
+                root: 0,
+            }),
+            commit: 0,
+            starting_page_num: 1,
+            starting_root: 0,
+        };
+        (read, write)
+    }
+
+    struct BasicDbWrite {
+        inner: Arc<RwLock<BasicDbInner>>,
+        cell: UnsafeCell<BasicDbWriteCell>,
+        commit: u64,
+        starting_page_num: u64,
+        starting_root: u64,
+    }
+
+    struct BasicDbWriteCell {
+        page_num: u64,
+        dirty: BTreeMap<u64, Box<[u8]>>,
+        to_drop: VecDeque<(u64, Vec<u64>)>,
+        root: u64,
+    }
+
+    impl BasicDbWrite {
+        fn commit(&mut self) {
+            let mut inner = self.inner.write().unwrap();
+
+            // Move the dirty pages into the full tree map.
+            let dirty = &mut self.cell.get_mut().dirty;
+            while let Some(d) = dirty.pop_last() {
+                inner.memory.insert(d.0, d.1);
+            }
+
+            // Update the rest of our state.
+            self.starting_page_num = self.cell.get_mut().page_num;
+            self.starting_root = self.cell.get_mut().root;
+            self.commit += 1;
+            inner.root = self.cell.get_mut().root;
+            inner.commit += 1;
+
+            // Ditch any unused pages
+            let oldest_co = inner.checkouts.first().map(|(c,_)| *c).unwrap_or(u64::MAX);
+            while let Some(d) = self.cell.get_mut().to_drop.pop_front() {
+                if d.0 >= oldest_co {
+                    self.cell.get_mut().to_drop.push_front(d);
+                    break;
+                }
+                for d in d.1 {
+                    inner.memory.remove(&d);
+                }
+            }
+        }
+
+        fn reset(&mut self) {
+            let cell = self.cell.get_mut();
+            if let Some((co, _)) = cell.to_drop.back() {
+                if *co == (self.commit+1) {
+                    cell.to_drop.pop_back();
+                }
+            }
+            cell.dirty.clear();
+            cell.page_num = self.starting_page_num;
+            cell.root = self.starting_root;
+        }
+
+        fn tree(&mut self) -> Result<BTreeWrite<'_, LayoutU64U64, LayoutU64Var, Self>, Error> {
+            unsafe {
+                let (tree, root) = BTreeWrite::load(self, (*self.cell.get()).root)?;
+                if let Some(root) = root {
+                    (*self.cell.get()).root = root;
+                }
+                Ok(tree)
+            }
+        }
+
+    }
+
+    unsafe impl RawRead for BasicDbWrite {
+        unsafe fn load(&self, page: u64, num_pages: usize) -> Result<&[u8], StorageError> {
+            let inner = self.inner.read().unwrap();
+            let mem = inner
+                .memory
+                .get(&page)
+                .ok_or(StorageError::OutOfRange(page))?;
+            if mem.len() != (num_pages * PAGE_4K) {
+                return Err(StorageError::Corruption(
+                    "Incorrect size for the requested page",
+                ));
+            }
+            // We pinky-promised that we won't drop this memory until this
+            // reader's checkout advances (or it is dropped)
+            unsafe { Ok(core::slice::from_raw_parts(mem.as_ptr(), mem.len())) }
+        }
+    }
+
+    unsafe impl RawWrite for BasicDbWrite {
+        fn allocate(&self, num_pages: usize) -> Result<(&mut [u8], u64), StorageError> {
+            unsafe {
+                let page_num = (*self.cell.get()).page_num;
+                (*self.cell.get()).page_num += 1;
+
+                let mut mem = alloc_paged(num_pages);
+                let raw = core::slice::from_raw_parts_mut(mem.as_mut_ptr(), mem.len());
+                (*self.cell.get()).dirty.insert(page_num, mem);
+                Ok((raw, page_num))
+            }
+        }
+
+        unsafe fn deallocate(&self, page: u64, _num_pages: usize) -> Result<(), StorageError> {
+            unsafe {
+                if (*self.cell.get()).dirty.remove(&page).is_some() {
+                    return Ok(());
+                }
+                let to_drop = &mut (*self.cell.get()).to_drop;
+                if let Some(td) = to_drop.back_mut() {
+                    if td.0 == (self.commit+1) {
+                        td.1.push(page);
+                    }
+                    else {
+                        to_drop.push_back((self.commit+1, vec![page]));
+                    }
+                }
+                else {
+                    to_drop.push_back((self.commit+1, vec![page]));
+                }
+                Ok(())
+            }
+        }
+
+        unsafe fn load_mut(&self, page: u64, num_pages: usize) -> Result<LoadMut, StorageError> {
+            unsafe {
+                if let Some(p) = (*self.cell.get()).dirty.get_mut(&page) {
+                    return Ok(LoadMut::Dirty(core::slice::from_raw_parts_mut(
+                        p.as_mut_ptr(),
+                        p.len(),
+                    )));
+                }
+                let read = self.load(page, num_pages)?;
+                let (write, write_page) = self.allocate(num_pages)?;
+                Ok(LoadMut::Clean {
+                    write,
+                    write_page,
+                    read,
+                })
+            }
+        }
+    }
+
+    #[test]
+    fn simple() {
+        let (reader, mut writer) = new_db();
+        let p = writer.allocate_page().unwrap();
+        let p_num = p.1;
+        let (p, _) = p.0.split_at_mut(4);
+        p.copy_from_slice(&[5,6,7,8]);
+        writer.commit();
+        unsafe {
+            let p = reader.load(p_num, 1).unwrap();
+            let (p, _) = p.split_at(4);
+            dbg!(p);
+        }
+    }
 }

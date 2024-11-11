@@ -62,6 +62,8 @@ pub enum Error {
     UnexpectedNoOp,
     /// Attempted to perform an invalid operation (ex. trying to resize a u64 key).
     IncorrectOperation,
+    /// Database structure entered into an invalid state.
+    InvalidState(&'static str),
 }
 
 impl core::error::Error for Error {
@@ -87,6 +89,7 @@ impl core::fmt::Display for Error {
             Self::IncorrectOperation => {
                 f.write_str("attempted to perform a nonsensical operation on the database")
             }
+            Self::InvalidState(s) => write!(f, "Invalid database system state: {}", s),
         }
     }
 }

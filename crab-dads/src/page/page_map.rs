@@ -1,9 +1,11 @@
-use core::{marker::PhantomData, slice};
+use core::{cmp::Ordering, marker::PhantomData, slice};
 
-use crate::{arrays::{KeyValArray, RevSizedArray}, Error, TwoArrayTrailer, PAGE_4K};
+use crate::{
+    arrays::{KeyValArray, RevSizedArray},
+    Error, TwoArrayTrailer, PAGE_4K,
+};
 
 use super::{PageLayout, PageMapMut, CONTENT_SIZE};
-
 
 #[repr(transparent)]
 pub struct PageMap<'a, T: PageLayout> {
@@ -50,6 +52,25 @@ impl<'a, T: PageLayout> PageMap<'a, T> {
         }
     }
 
+    #[allow(clippy::type_complexity)]
+    pub fn get_pair(&self, key: &T::Key) -> Result<Option<(&'a T::Key, &'a T::Value)>, Error> {
+        for res in self.iter() {
+            let (k,v) = res?;
+            match k.cmp(key) {
+                Ordering::Equal => return Ok(Some((k,v))),
+                Ordering::Greater => (),
+                Ordering::Less => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn get(&self, key: &T::Key) -> Result<Option<&'a T::Value>, Error> {
+        let res = self.get_pair(key)?;
+        let Some((_, v)) = res else { return Ok(None) };
+        Ok(Some(v))
+    }
+
     /// Copy a page's content to a new page.
     pub fn copy_to<'b>(&self, dst: &'b mut [u8; PAGE_4K]) -> PageMapMut<'b, T> {
         unsafe {
@@ -69,7 +90,6 @@ impl<'a, T: PageLayout> PageMap<'a, T> {
         }
     }
 }
-
 
 #[derive(Debug)]
 pub struct PageIter<'a, T: PageLayout> {

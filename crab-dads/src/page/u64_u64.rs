@@ -45,15 +45,15 @@ unsafe impl PageLayout for LayoutU64U64 {
         unsafe { &mut *(src.as_mut_ptr() as *mut u64) }
     }
 
-    unsafe fn write_key(&mut self, key: &Self::Key, dest: &mut [u8]) {
+    unsafe fn write_key(&mut self, key: &Self::Key, dst: &mut [u8]) {
         unsafe {
-            (dest.as_mut_ptr() as *mut u64).write(*key);
+            (dst.as_mut_ptr() as *mut u64).write(*key);
         }
     }
 
-    unsafe fn write_value(&mut self, val: &Self::Value, dest: &mut [u8]) {
+    unsafe fn write_value(&mut self, val: &Self::Value, dst: &mut [u8]) {
         unsafe {
-            (dest.as_mut_ptr() as *mut u64).write(*val);
+            (dst.as_mut_ptr() as *mut u64).write(*val);
         }
     }
 }

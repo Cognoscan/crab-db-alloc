@@ -43,7 +43,7 @@ impl<'a, T: CheckedBitPattern> Iterator for RevSizedArray<'a, T> {
             if !T::is_valid_bit_pattern(&*(self.front as *const T::Bits)) {
                 return Some(Err(Error::DataCorruption));
             }
-            Some(Ok(&*(self.front as *const T)))
+            Some(Ok(&*self.front))
         }
     }
 
@@ -66,7 +66,7 @@ impl<'a, T: CheckedBitPattern> DoubleEndedIterator for RevSizedArray<'a, T> {
             if !T::is_valid_bit_pattern(&*(self.back as *const T::Bits)) {
                 return Some(Err(Error::DataCorruption));
             }
-            let ret = &*(self.back as *const T);
+            let ret = &*self.back;
             self.back = self.back.add(1);
             Some(Ok(ret))
         }
@@ -110,7 +110,7 @@ impl<'a, T: CheckedBitPattern> Iterator for RevSizedArrayMut<'a, T> {
             if !T::is_valid_bit_pattern(&*(self.front as *const T::Bits)) {
                 return Some(Err(Error::DataCorruption));
             }
-            Some(Ok(&mut *(self.front as *mut T)))
+            Some(Ok(&mut *self.front))
         }
     }
 
@@ -133,7 +133,7 @@ impl<'a, T: CheckedBitPattern> DoubleEndedIterator for RevSizedArrayMut<'a, T> {
             if !T::is_valid_bit_pattern(&*(self.back as *const T::Bits)) {
                 return Some(Err(Error::DataCorruption));
             }
-            let ret = &mut *(self.back as *mut T);
+            let ret = &mut *self.back;
             self.back = self.back.add(1);
             Some(Ok(ret))
         }
