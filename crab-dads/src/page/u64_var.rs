@@ -28,7 +28,7 @@ unsafe impl PageLayout for LayoutU64Var {
     }
 
     fn value_len(&self) -> usize {
-        ((self.len + 7) / 8) as usize
+        ((self.len + 7) & !7) as usize
     }
 
     unsafe fn read_key<'a>(&'a self, src: &'a [u8]) -> &'a Self::Key {
@@ -47,7 +47,7 @@ unsafe impl PageLayout for LayoutU64Var {
         if value.len() > MAX_VAR_SIZE {
             return Err(Error::WriteTooLarge);
         }
-        Ok((value.len() + 7) / 8)
+        Ok((value.len() + 7) & !7)
     }
 
     unsafe fn write_value(&mut self, val: &Self::Value, dst: &mut [u8]) {

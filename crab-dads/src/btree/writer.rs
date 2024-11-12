@@ -82,7 +82,7 @@ where
             writer,
             branches: Vec::new(),
             leaf: None,
-            root: page,
+            root: root_page_num,
         };
         match root {
             WritePage::Branch(b) => s.branches.push((b, root_page_num)),
@@ -306,7 +306,7 @@ where
                     .ok_or(Error::DataCorruption)??;
                 branch.0 = match branch.0.entry(k)? {
                     page::Entry::Occupied(_) => return Err(Error::DataCorruption),
-                    page::Entry::Vacant(v) => v.insert(&leaf.1).map_err(|(_, e)| e)?.to_page(),
+                    page::Entry::Vacant(v) => v.insert(&copy_leaf.1).map_err(|(_, e)| e)?.to_page(),
                 };
                 let b = self.branch_insert(branch, (k2, new_leaf.1))?;
                 self.branches.push(b);

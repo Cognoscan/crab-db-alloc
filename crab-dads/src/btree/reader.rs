@@ -213,8 +213,8 @@ where
                                 };
                                 return Ok(Some(v));
                             },
-                            Ordering::Greater => continue,
-                            Ordering::Less => return Ok(None),
+                            Ordering::Less => continue,
+                            Ordering::Greater => return Ok(None),
                         }
                     }
                     return Ok(None);

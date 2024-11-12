@@ -180,6 +180,7 @@ mod test {
 
     use super::*;
 
+    #[derive(Clone)]
     struct BasicDbInner {
         root: u64,
         memory: BTreeMap<u64, Box<[u8]>>,
@@ -187,6 +188,49 @@ mod test {
         commit: u64,
     }
 
+    struct CheckoutFmt<'a>(&'a [(u64,u64)]);
+    impl<'a> std::fmt::Debug for CheckoutFmt<'a> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("[ ")?;
+            for (commit, count) in self.0 {
+                write!(f, "{}:{}, ", commit, count)?;
+            }
+            f.write_str("]")
+        }
+    }
+
+    struct MemoryFmt<'a>(&'a BTreeMap<u64, Box<[u8]>>);
+    impl<'a> std::fmt::Debug for MemoryFmt<'a> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            for page in self.0.iter() {
+                writeln!(f, "Page {}", page.0)?;
+                f.write_str("    ")?;
+                for (idx, byte) in page.1.iter().enumerate() {
+                    write!(f, "{:02x}", byte)?;
+                    if (idx & 0x3) == 3 { f.write_str(" ")?; }
+                    if (idx & 0x1F) == 0x1F { 
+                        writeln!(f)?;
+                        f.write_str("    ")?;
+                    }
+                }
+                writeln!(f)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl std::fmt::Debug for BasicDbInner {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("BasicDbInner")
+            .field("root", &self.root)
+            .field("commit", &self.commit)
+            .field("checkouts", &CheckoutFmt(self.checkouts.as_slice()))
+            .field("memory", &MemoryFmt(&self.memory))
+            .finish()
+        }
+    }
+
+    #[derive(Debug)]
     struct BasicDbRead {
         inner: Arc<RwLock<BasicDbInner>>,
         root: u64,
@@ -302,6 +346,7 @@ mod test {
         (read, write)
     }
 
+    #[derive(Debug)]
     struct BasicDbWrite {
         inner: Arc<RwLock<BasicDbInner>>,
         cell: UnsafeCell<BasicDbWriteCell>,
@@ -315,6 +360,16 @@ mod test {
         dirty: BTreeMap<u64, Box<[u8]>>,
         to_drop: VecDeque<(u64, Vec<u64>)>,
         root: u64,
+    }
+
+    impl std::fmt::Debug for BasicDbWriteCell {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("BasicDbWriteCell")
+            .field("root", &self.root)
+            .field("page_num", &self.page_num)
+            .field("dirty", &MemoryFmt(&self.dirty))
+            .finish_non_exhaustive()
+        }
     }
 
     impl BasicDbWrite {
@@ -443,7 +498,7 @@ mod test {
     }
 
     #[test]
-    fn simple() {
+    fn debug_allocator() {
         let (reader, mut writer) = new_db();
         let p = writer.allocate_page().unwrap();
         let p_num = p.1;
@@ -454,6 +509,33 @@ mod test {
             let p = reader.load(p_num, 1).unwrap();
             let (p, _) = p.split_at(4);
             dbg!(p);
+        }
+    }
+
+    #[test]
+    fn initial() {
+        let (reader, mut writer) = new_db();
+        let mut tree = writer.tree().unwrap();
+        let i_len = 228;
+        for i in 0..i_len {
+
+            match tree.entry(&i).unwrap() {
+                Entry::Occupied(_) => panic!("All entries should be empty right now"),
+                Entry::Vacant(v) => {
+                    v.insert(i.to_le_bytes().as_slice()).unwrap();
+                }
+            }
+        }
+        writer.commit();
+
+        dbg!(&writer);
+
+        let reader = reader.reload();
+        let tree = reader.tree().unwrap();
+        for i in 0..i_len {
+            dbg!(i);
+            let val = tree.get(&i).unwrap().unwrap();
+            assert_eq!(val, i.to_le_bytes().as_slice());
         }
     }
 }

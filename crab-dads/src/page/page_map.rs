@@ -74,15 +74,19 @@ impl<'a, T: PageLayout> PageMap<'a, T> {
     /// Copy a page's content to a new page.
     pub fn copy_to<'b>(&self, dst: &'b mut [u8; PAGE_4K]) -> PageMapMut<'b, T> {
         unsafe {
+            // Copy the lower region
             let lengths = self.page_trailer().lengths_unchecked();
             core::ptr::copy_nonoverlapping(self.page, dst.as_mut_ptr(), lengths.lower);
+
+            // Copy the upper region, including the trailer data
             let upper_bytes = lengths.upper_bytes::<T>() + core::mem::size_of::<TwoArrayTrailer>();
-            let upper_offset = CONTENT_SIZE - upper_bytes;
+            let upper_offset = PAGE_4K - upper_bytes;
             core::ptr::copy_nonoverlapping(
                 self.page.add(upper_offset),
                 dst.as_mut_ptr().add(upper_offset),
                 upper_bytes,
             );
+
             PageMapMut {
                 page: dst.as_mut_ptr(),
                 layout: PhantomData,

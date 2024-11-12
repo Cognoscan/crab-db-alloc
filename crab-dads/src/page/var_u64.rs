@@ -57,16 +57,16 @@ unsafe impl PageLayout for LayoutVarU64 {
         unsafe { &mut *(src.as_mut_ptr() as *mut u64) }
     }
 
-    unsafe fn write_key(&mut self, key: &Self::Key, dest: &mut [u8]) {
+    unsafe fn write_key(&mut self, key: &Self::Key, dst: &mut [u8]) {
         unsafe {
             self.len = key.len() as u16;
-            core::ptr::copy_nonoverlapping(key.as_ptr(), dest.as_mut_ptr(), key.len());
+            core::ptr::copy_nonoverlapping(key.as_ptr(), dst.as_mut_ptr(), key.len());
         }
     }
 
-    unsafe fn write_value(&mut self, val: &Self::Value, dest: &mut [u8]) {
+    unsafe fn write_value(&mut self, val: &Self::Value, dst: &mut [u8]) {
         unsafe {
-            (dest.as_mut_ptr() as *mut u64).write(*val);
+            (dst.as_mut_ptr() as *mut u64).write(*val);
         }
     }
 

@@ -1,4 +1,4 @@
-#![no_std]
+//#![no_std]
 #![warn(unsafe_op_in_unsafe_fn)]
 
 extern crate alloc;

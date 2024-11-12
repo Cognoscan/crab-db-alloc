@@ -636,7 +636,7 @@ impl<'a, 'k, T: PageLayout> VacantEntry<'a, 'k, T> {
         let total_len = unsafe { self.trailer.lengths_unchecked().total::<u8, T>() };
         let free = CONTENT_SIZE - total_len;
         let needed = key_len + val_len + core::mem::size_of::<T>();
-        if needed < free {
+        if needed > free {
             return Err((self, Error::OutofSpace(needed)));
         }
 

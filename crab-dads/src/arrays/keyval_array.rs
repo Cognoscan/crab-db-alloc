@@ -255,6 +255,7 @@ impl<'a> KeyValArrayMutResize<'a> {
             self.end = self.end.add(pair_size);
             self.back = self.prev_back_key;
             self.back_val = self.prev_back_key.add(key_size);
+            self.prev_back_key = self.prev_back_key.add(pair_size);
         }
     }
 
@@ -303,6 +304,7 @@ impl<'a> KeyValArrayMutResize<'a> {
             );
             self.prev_back_key = self.back;
             self.back_val = self.back;
+            self.end = self.end.offset(-len);
             len
         }
     }
