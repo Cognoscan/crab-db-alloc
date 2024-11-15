@@ -12,7 +12,7 @@ use crate::Error;
 /// - `write_key` and `write_value` must work even if the current bit pattern is
 ///   incorrect.
 pub unsafe trait PageLayout: NoUninit + CheckedBitPattern + Default {
-    type Key: Ord + ?Sized;
+    type Key: Ord + core::fmt::Debug + ?Sized;
     type Value: ?Sized;
 
     /// The size of the variable-length portion of the current key.

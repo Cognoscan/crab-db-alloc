@@ -18,10 +18,8 @@ const CONTENT_SIZE: usize = PAGE_4K - core::mem::size_of::<TwoArrayTrailer>();
 pub const MAX_VAR_SIZE: usize = 1008;
 
 use crate::{
-    arrays::{
-        KeyValArrayMut, KeyValArrayMutResize, RevSizedArray, RevSizedArrayMutResize,
-    },
-    Error, TwoArrayTrailer, PAGE_4K,
+    arrays::{KeyValArrayMut, KeyValArrayMutResize, RevSizedArray, RevSizedArrayMutResize},
+    ByteFormatter, Error, TwoArrayTrailer, PAGE_4K,
 };
 
 struct Cutpoint {
@@ -47,6 +45,24 @@ pub fn page_type(page: &[u8; PAGE_4K]) -> u8 {
 pub struct PageMapMut<'a, T: PageLayout> {
     layout: PhantomData<&'a mut T>,
     page: *mut u8,
+}
+
+impl<'a, T: PageLayout> core::fmt::Debug for PageMapMut<'a, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (lower, upper) = unsafe {
+            let lengths = self.page_trailer().lengths_unchecked();
+            let upper_bytes = lengths.upper_bytes::<T>();
+            let lower = slice::from_raw_parts(self.page, lengths.lower_bytes::<u8>());
+            let upper =
+                slice::from_raw_parts(self.page.add(CONTENT_SIZE - upper_bytes), upper_bytes);
+            (lower, upper)
+        };
+        f.debug_struct(core::any::type_name::<Self>())
+            .field("trailer", self.page_trailer())
+            .field("lower_bytes", &ByteFormatter::new(lower))
+            .field("upper_bytes", &ByteFormatter::new(upper))
+            .finish()
+    }
 }
 
 impl<'a, T: PageLayout> PageMapMut<'a, T> {
@@ -104,14 +120,14 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                 let pair_len = pair_info.key_len() + pair_info.value_len();
                 let add_len = pair_len + core::mem::size_of::<T>();
                 if (add_len + move_amount) > target {
-                    let mut new_upper_len_bytes = info.remaining_bytes();
+                    let mut new_upper_len_bytes = lengths.upper_bytes::<T>() - info.remaining_bytes();
                     // Determine if we actually take this final key-value pair or
                     // not. Choose whatever gets us closer to an even split.
                     if ((add_len + move_amount - target) > (target - move_amount))
                         || ((move_amount + add_len) > max)
                     {
                         // We don't want to take it.
-                        new_upper_len_bytes += core::mem::size_of::<T>();
+                        new_upper_len_bytes -= core::mem::size_of::<T>();
                     } else {
                         // We do want to take it
                         taken_lower += pair_len;
@@ -151,7 +167,11 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
             let split_lower_len = lengths.lower_bytes::<u8>() - cutpoint.lower_len;
             let upper_len_bytes = lengths.upper_bytes::<T>();
             let split_upper_len_bytes = upper_len_bytes - cutpoint.upper_bytes;
-            core::ptr::copy_nonoverlapping(self.page, new_page.page, split_lower_len);
+            core::ptr::copy_nonoverlapping(
+                self.page.add(cutpoint.lower_len),
+                new_page.page,
+                split_lower_len,
+            );
             core::ptr::copy_nonoverlapping(
                 self.page.add(CONTENT_SIZE - upper_len_bytes),
                 new_page.page.add(CONTENT_SIZE - split_upper_len_bytes),
@@ -165,6 +185,9 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
             let new_trailer = new_page.page_trailer_mut();
             new_trailer.set_lower_len(split_lower_len as u16);
             new_trailer.set_upper_len((split_upper_len_bytes / core::mem::size_of::<T>()) as u16);
+
+            debug_assert!(self.as_const().verify().is_ok(), "newly split page should be valid");
+            debug_assert!(new_page.as_const().verify().is_ok(), "split-up page should be valid");
 
             Ok(new_page)
         }
@@ -674,7 +697,10 @@ impl<'a, 'k, T> VacantEntry<'a, 'k, T>
 where
     T: PageLayoutVectored,
 {
-    pub fn insert_vectored(mut self, value: &[&T::Value]) -> Result<OccupiedEntry<'a, T>, (Self, Error)> {
+    pub fn insert_vectored(
+        mut self,
+        value: &[&T::Value],
+    ) -> Result<OccupiedEntry<'a, T>, (Self, Error)> {
         // Length calculations and checking
         let key_len = match T::determine_key_len(self.key) {
             Ok(len) => len,

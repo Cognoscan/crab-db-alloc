@@ -1,5 +1,6 @@
 use super::*;
 
+#[derive(Clone)]
 #[repr(C)]
 pub struct TwoArrayTrailer {
     /// lower array length (grows up from start of the page)
@@ -12,6 +13,17 @@ pub struct TwoArrayTrailer {
     pub page_type: u8,
 }
 
+impl core::fmt::Debug for TwoArrayTrailer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TwoArrayTrailer")
+            .field("page_type", &self.page_type)
+            .field("lower_len", &self.lower_len)
+            .field("upper_len", &self.upper_len)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug)]
 /// The lengths of the two arrays within a page.
 pub struct TwoArrayLengths {
     /// lower array length, in elements
@@ -21,10 +33,9 @@ pub struct TwoArrayLengths {
 }
 
 impl TwoArrayLengths {
-
     /// Get the total number of bytes, given the element type of the lower array
     /// (`L`) and the upper array (`U`).
-    pub fn total<L,U>(&self) -> usize {
+    pub fn total<L, U>(&self) -> usize {
         self.lower_bytes::<L>() + self.upper_bytes::<U>()
     }
 
@@ -40,15 +51,14 @@ impl TwoArrayLengths {
 }
 
 impl TwoArrayTrailer {
-
     /// Extract the lengths of the fixed and variable portions, erroring if they
     /// are out of range or are invalid. The check ensures that pointers can be
     /// constructed from these lengths in combination with a pointer to the base
     /// of the page.
     #[inline]
-    pub fn lengths<L,U>(&self, space: usize) -> Result<TwoArrayLengths, Error> {
+    pub fn lengths<L, U>(&self, space: usize) -> Result<TwoArrayLengths, Error> {
         let ret = unsafe { self.lengths_unchecked() };
-        if ret.total::<L,U>() > space {
+        if ret.total::<L, U>() > space {
             return Err(Error::DataCorruption);
         }
         Ok(ret)
@@ -58,9 +68,9 @@ impl TwoArrayTrailer {
     /// in range and valid. This check should generally be performed at least
     /// once by using the checked version of this function call,
     /// [`lengths`](#method.lengths).
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// This is technically safe to call, but see the above advice before doing
     /// anything with the result of this function.
     pub unsafe fn lengths_unchecked(&self) -> TwoArrayLengths {
@@ -78,9 +88,9 @@ impl TwoArrayTrailer {
     }
 
     /// Add to the upper length.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// The delta must not cause the length to over/underflow a `u16` value.
     #[inline]
     pub unsafe fn add_to_upper_len(&mut self, delta: isize) {
@@ -97,9 +107,9 @@ impl TwoArrayTrailer {
     }
 
     /// Add to the lower length.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// The delta must not cause the length to over/underflow a `u16` value.
     #[inline]
     pub unsafe fn add_to_lower_len(&mut self, delta: isize) {
@@ -107,5 +117,4 @@ impl TwoArrayTrailer {
         debug_assert!(len <= 4088);
         self.lower_len = len as u16;
     }
-
 }

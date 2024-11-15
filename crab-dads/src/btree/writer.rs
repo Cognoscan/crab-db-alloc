@@ -284,6 +284,7 @@ where
             .iter()
             .next()
             .ok_or(Error::InvalidState("split leaf shouldn't be empty"))??;
+        println!("Page split complete");
 
         let leaf = match self.branches.pop() {
             None => {
@@ -309,11 +310,13 @@ where
                     page::Entry::Vacant(v) => v.insert(&copy_leaf.1).map_err(|(_, e)| e)?.to_page(),
                 };
                 let b = self.branch_insert(branch, (k2, new_leaf.1))?;
+
                 self.branches.push(b);
                 copy_leaf
             }
             Some(b) => {
                 let b = self.branch_insert(b, (k2, new_leaf.1))?;
+
                 self.branches.push(b);
                 leaf
             }
@@ -645,6 +648,8 @@ where
             Err((entry, Error::OutofSpace(_))) => entry,
             Err((_, e)) => return Err(e),
         };
+
+        println!("Splitting the page");
 
         // We need to split the page.
         let leaf = self

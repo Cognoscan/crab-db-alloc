@@ -1,8 +1,7 @@
 use core::{cmp::Ordering, marker::PhantomData, slice};
 
 use crate::{
-    arrays::{KeyValArray, RevSizedArray},
-    Error, TwoArrayTrailer, PAGE_4K,
+    arrays::{KeyValArray, RevSizedArray}, ByteFormatter, Error, TwoArrayTrailer, PAGE_4K
 };
 
 use super::{PageLayout, PageMapMut, CONTENT_SIZE};
@@ -19,6 +18,23 @@ impl<'a, T: PageLayout> Clone for PageMap<'a, T> {
             page: self.page,
             layout: PhantomData,
         }
+    }
+}
+
+impl<'a, T: PageLayout> core::fmt::Debug for PageMap<'a, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (lower, upper) = unsafe {
+            let lengths = self.page_trailer().lengths_unchecked();
+            let upper_bytes = lengths.upper_bytes::<T>();
+            let lower = slice::from_raw_parts(self.page, lengths.lower_bytes::<u8>());
+            let upper = slice::from_raw_parts(self.page.add(CONTENT_SIZE-upper_bytes), upper_bytes);
+            (lower, upper)
+        };
+        f.debug_struct(core::any::type_name::<Self>())
+            .field("trailer", self.page_trailer())
+            .field("lower_bytes", &ByteFormatter::new(lower))
+            .field("upper_bytes", &ByteFormatter::new(upper))
+            .finish()
     }
 }
 
@@ -55,9 +71,9 @@ impl<'a, T: PageLayout> PageMap<'a, T> {
     #[allow(clippy::type_complexity)]
     pub fn get_pair(&self, key: &T::Key) -> Result<Option<(&'a T::Key, &'a T::Value)>, Error> {
         for res in self.iter() {
-            let (k,v) = res?;
+            let (k, v) = res?;
             match k.cmp(key) {
-                Ordering::Equal => return Ok(Some((k,v))),
+                Ordering::Equal => return Ok(Some((k, v))),
                 Ordering::Greater => (),
                 Ordering::Less => return Ok(None),
             }
@@ -92,6 +108,20 @@ impl<'a, T: PageLayout> PageMap<'a, T> {
                 layout: PhantomData,
             }
         }
+    }
+
+    pub fn verify(&self) -> Result<(), Error> {
+        let mut last_key = None;
+        for res in self.iter() {
+            let (k,_) = res?;
+            if let Some(last_key) = last_key {
+                if last_key >= k {
+                    return Err(Error::DataCorruption);
+                }
+            }
+            last_key = Some(k);
+        }
+        Ok(())
     }
 }
 

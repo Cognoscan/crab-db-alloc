@@ -97,3 +97,24 @@ impl core::fmt::Display for Error {
 /// 4 kiB page. Standard on most architectures, particularly x64, RISC-V, and
 /// non-Apple ARM.
 const PAGE_4K: usize = 1 << 12;
+
+
+pub(crate) struct ByteFormatter<'a>(&'a [u8]);
+
+impl<'a> ByteFormatter<'a> { 
+    pub fn new(bytes: &'a[u8]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl<'a> core::fmt::Debug for ByteFormatter<'a> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        writeln!(f)?;
+        for (idx, byte) in self.0.iter().enumerate() {
+            write!(f, "{:02X}", byte)?;
+            if (idx & 0x1f) == 0x1f { writeln!(f)?; continue; }
+            if (idx & 3) == 3 { f.write_str(" ")?; }
+        }
+        writeln!(f)
+    }
+}
