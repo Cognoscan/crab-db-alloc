@@ -418,6 +418,7 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                     Ordering::Equal => {
                         return Ok(Entry::Occupied(OccupiedEntry {
                             page: self.page,
+                            first: info.remaining_bytes() == 0,
                             trailer,
                             kv,
                             info,
@@ -426,6 +427,7 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                     Ordering::Less => {
                         return Ok(Entry::Vacant(VacantEntry {
                             page: self.page,
+                            first: false,
                             trailer,
                             kv,
                             info,
@@ -438,6 +440,7 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
             kv.next_pair_back_none()?;
             Ok(Entry::Vacant(VacantEntry {
                 page: self.page,
+                first: true,
                 info,
                 trailer,
                 kv,
@@ -529,12 +532,19 @@ pub enum Entry<'a, 'k, T: PageLayout> {
 /// An occupied entry in the map, ready to be inspected and modified.
 pub struct OccupiedEntry<'a, T: PageLayout> {
     page: *mut u8,
+    first: bool,
     info: RevSizedArrayMutResize<'a, T>,
     trailer: &'a mut TwoArrayTrailer,
     kv: KeyValArrayMutResize<'a>,
 }
 
 impl<'a, T: PageLayout> OccupiedEntry<'a, T> {
+
+    /// Returns true if this is the first entry in the page.
+    pub fn first(&self) -> bool {
+        self.first
+    }
+
     /// Get a reference to the key in the entry.
     pub fn key(&self) -> &T::Key {
         unsafe {
@@ -633,6 +643,7 @@ where
 /// An empty entry in the map, ready to be filled.
 pub struct VacantEntry<'a, 'k, T: PageLayout> {
     page: *mut u8,
+    first: bool,
     info: RevSizedArrayMutResize<'a, T>,
     trailer: &'a mut TwoArrayTrailer,
     kv: KeyValArrayMutResize<'a>,
@@ -640,6 +651,12 @@ pub struct VacantEntry<'a, 'k, T: PageLayout> {
 }
 
 impl<'a, 'k, T: PageLayout> VacantEntry<'a, 'k, T> {
+
+    /// Get if this will become the first entry in the page when inserted into.
+    pub fn first(&self) -> bool {
+        self.first
+    }
+
     /// Get the key for this vacant entry.
     pub fn key(&self) -> &T::Key {
         unsafe { self.info.get().read_key(self.kv.key()) }
@@ -678,6 +695,7 @@ impl<'a, 'k, T: PageLayout> VacantEntry<'a, 'k, T> {
 
         Ok(OccupiedEntry {
             page: self.page,
+            first: self.first,
             info: self.info,
             trailer: self.trailer,
             kv: self.kv,
@@ -731,6 +749,7 @@ where
         }
 
         Ok(OccupiedEntry {
+            first: self.first,
             page: self.page,
             info: self.info,
             trailer: self.trailer,

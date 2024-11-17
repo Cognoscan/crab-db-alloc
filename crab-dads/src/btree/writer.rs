@@ -126,7 +126,6 @@ where
         };
 
         let mut depth = 0;
-        let mut first = false;
         loop {
             let mut branch_page = match page {
                 WritePage::Leaf(l) => match l.entry(key)? {
@@ -140,7 +139,6 @@ where
                             key,
                             entry: e,
                             entry_page_num: page_num,
-                            first,
                         }));
                     }
                     page::Entry::Vacant(e) => {
@@ -149,7 +147,6 @@ where
                             key,
                             entry: e,
                             entry_page_num: page_num,
-                            first,
                         }));
                     }
                 },
@@ -158,12 +155,10 @@ where
 
             // Seek the appropriate sub-page in the branch.
             let mut val = None;
-            first = true;
             for res in branch_page.iter_mut().rev() {
                 let (k, v) = res?;
                 val = Some(v);
                 if k <= key {
-                    first = false;
                     break;
                 }
             }
@@ -284,7 +279,6 @@ where
             .iter()
             .next()
             .ok_or(Error::InvalidState("split leaf shouldn't be empty"))??;
-        println!("Page split complete");
 
         let leaf = match self.branches.pop() {
             None => {
@@ -495,7 +489,6 @@ where
     key: &'k L::Key,
     entry: page::OccupiedEntry<'a, L>,
     entry_page_num: u64,
-    first: bool,
 }
 
 impl<'a, 't, 'k, B, L, W> OccupiedEntry<'a, 't, 'k, B, L, W>
@@ -519,8 +512,9 @@ where
     pub fn delete(self) -> Result<(), Error> {
         // Delete the entry, and fix up the tree if it was the first entry in
         // the page.
+        let first = self.entry.first();
         let mut page = self.entry.delete();
-        if self.first {
+        if first {
             let (new_key, _) = page.iter_mut().next().ok_or(Error::DataCorruption)??;
             self.tree.replace_branch_first(self.key, new_key)?;
         }
@@ -555,7 +549,6 @@ where
             key: self.key,
             entry,
             entry_page_num: leaf.1,
-            first: self.first,
         })
     }
 }
@@ -589,7 +582,6 @@ where
             key: self.key,
             entry,
             entry_page_num: leaf.1,
-            first: self.first,
         })
     }
 }
@@ -604,7 +596,6 @@ where
     key: &'k L::Key,
     entry: page::VacantEntry<'a, 'k, L>,
     entry_page_num: u64,
-    first: bool,
 }
 
 impl<'a, 't, 'k, B, L, W> VacantEntry<'a, 't, 'k, B, L, W>
@@ -618,38 +609,37 @@ where
     }
 
     pub fn insert(self, new_value: &L::Value) -> Result<OccupiedEntry<'a, 't, 'k, B, L, W>, Error> {
-        // Handle the case where we're inserting right at the very front of the
-        // tree.
-        let entry = if self.first {
-            let mut leaf = self.entry.to_page();
-            let (old_key, _) = leaf.iter_mut().next().ok_or(Error::InvalidState("Expected page to have at least one entry present when inserting to the front of a leaf"))??;
-            self.tree.replace_branch_first(old_key, self.key)?;
-
-            let page::Entry::Vacant(v) = leaf.entry(self.key)? else {
-                return Err(Error::InvalidState(
-                    "Expected vacant entry to insert into, but it got filled somehow",
-                ));
-            };
-            v
-        } else {
-            self.entry
-        };
-
-        let entry = match entry.insert(new_value) {
+        let entry = match self.entry.insert(new_value) {
             Ok(entry) => {
+                // If we're the new first entry, see if there was an *old* first
+                // entry and make sure to update any parent branches.
+                let entry = if entry.first() {
+                    let mut leaf = entry.to_page();
+                    let mut iter = leaf.iter_mut();
+                    let _ = iter.next().ok_or(Error::InvalidState("After inserting a key-value pair into a page, there should be at least one present"))??;
+                    if let Some(old_pair) = iter.next() {
+                        let (old_key, _) = old_pair?;
+                        self.tree.replace_branch_first(old_key, self.key)?;
+                    }
+                    let page::Entry::Occupied(v) = leaf.entry(self.key)? else {
+                        return Err(Error::InvalidState(
+                            "Expected occupied entry we just inserted into, but it was empty somehow",
+                        ));
+                    };
+                    v
+                } else {
+                    entry
+                };
                 return Ok(OccupiedEntry {
                     tree: self.tree,
                     key: self.key,
                     entry,
                     entry_page_num: self.entry_page_num,
-                    first: self.first,
-                })
+                });
             }
             Err((entry, Error::OutofSpace(_))) => entry,
             Err((_, e)) => return Err(e),
         };
-
-        println!("Splitting the page");
 
         // We need to split the page.
         let leaf = self
@@ -661,12 +651,32 @@ where
             ));
         };
         let entry = entry.insert(new_value).map_err(|(_, e)| e)?;
+
+        // If we're the new first entry, see if there was an *old* first
+        // entry and make sure to update any parent branches.
+        let entry = if entry.first() {
+            let mut leaf = entry.to_page();
+            let mut iter = leaf.iter_mut();
+            let _ = iter.next().ok_or(Error::InvalidState("After inserting a key-value pair into a page, there should be at least one present"))??;
+            if let Some(old_pair) = iter.next() {
+                let (old_key, _) = old_pair?;
+                self.tree.replace_branch_first(old_key, self.key)?;
+            }
+            let page::Entry::Occupied(v) = leaf.entry(self.key)? else {
+                return Err(Error::InvalidState(
+                    "Expected occupied entry we just inserted into, but it was empty somehow",
+                ));
+            };
+            v
+        } else {
+            entry
+        };
+
         Ok(OccupiedEntry {
             tree: self.tree,
             key: self.key,
             entry,
             entry_page_num: leaf.1,
-            first: self.first,
         })
     }
 }
@@ -681,32 +691,33 @@ where
         self,
         new_value: &[&L::Value],
     ) -> Result<OccupiedEntry<'a, 't, 'k, B, L, W>, Error> {
-        // Handle the case where we're inserting right at the very front of the
-        // tree.
-        let entry = if self.first {
-            let mut leaf = self.entry.to_page();
-            let (old_key, _) = leaf.iter_mut().next().ok_or(Error::InvalidState("Expected page to have at least one entry present when inserting to the front of a leaf"))??;
-            self.tree.replace_branch_first(old_key, self.key)?;
-
-            let page::Entry::Vacant(v) = leaf.entry(self.key)? else {
-                return Err(Error::InvalidState(
-                    "Expected vacant entry to insert into, but it got filled somehow",
-                ));
-            };
-            v
-        } else {
-            self.entry
-        };
-
-        let entry = match entry.insert_vectored(new_value) {
+        let entry = match self.entry.insert_vectored(new_value) {
             Ok(entry) => {
+                // If we're the new first entry, see if there was an *old* first
+                // entry and make sure to update any parent branches.
+                let entry = if entry.first() {
+                    let mut leaf = entry.to_page();
+                    let mut iter = leaf.iter_mut();
+                    let _ = iter.next().ok_or(Error::InvalidState("After inserting a key-value pair into a page, there should be at least one present"))??;
+                    if let Some(old_pair) = iter.next() {
+                        let (old_key, _) = old_pair?;
+                        self.tree.replace_branch_first(old_key, self.key)?;
+                    }
+                    let page::Entry::Occupied(v) = leaf.entry(self.key)? else {
+                        return Err(Error::InvalidState(
+                            "Expected occupied entry we just inserted into, but it was empty somehow",
+                        ));
+                    };
+                    v
+                } else {
+                    entry
+                };
                 return Ok(OccupiedEntry {
                     tree: self.tree,
                     key: self.key,
                     entry,
                     entry_page_num: self.entry_page_num,
-                    first: self.first,
-                })
+                });
             }
             Err((entry, Error::OutofSpace(_))) => entry,
             Err((_, e)) => return Err(e),
@@ -722,12 +733,32 @@ where
             ));
         };
         let entry = entry.insert_vectored(new_value).map_err(|(_, e)| e)?;
+
+        // If we're the new first entry, see if there was an *old* first
+        // entry and make sure to update any parent branches.
+        let entry = if entry.first() {
+            let mut leaf = entry.to_page();
+            let mut iter = leaf.iter_mut();
+            let _ = iter.next().ok_or(Error::InvalidState("After inserting a key-value pair into a page, there should be at least one present"))??;
+            if let Some(old_pair) = iter.next() {
+                let (old_key, _) = old_pair?;
+                self.tree.replace_branch_first(old_key, self.key)?;
+            }
+            let page::Entry::Occupied(v) = leaf.entry(self.key)? else {
+                return Err(Error::InvalidState(
+                    "Expected occupied entry we just inserted into, but it was empty somehow",
+                ));
+            };
+            v
+        } else {
+            entry
+        };
+
         Ok(OccupiedEntry {
             tree: self.tree,
             key: self.key,
             entry,
             entry_page_num: leaf.1,
-            first: self.first,
         })
     }
 }

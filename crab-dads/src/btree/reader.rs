@@ -191,8 +191,6 @@ where
                 ReadPage::Branch(b) => {
                     for result in b.iter().rev() {
                         let (k, v) = result?;
-                        dbg!(&k);
-                        dbg!(&v);
                         if k.borrow() <= key {
                             page = unsafe { ReadPage::try_load(self.reader, *v)? };
                             continue 'outer;
@@ -210,11 +208,9 @@ where
                                 // and immutable as long as we have the reader,
                                 // so we can extract the object directly and
                                 // give it a new lifetime.
-                                let v = unsafe {
-                                    &*(v as *const L::Value)
-                                };
+                                let v = unsafe { &*(v as *const L::Value) };
                                 return Ok(Some(v));
-                            },
+                            }
                             Ordering::Less => continue,
                             Ordering::Greater => return Ok(None),
                         }
@@ -347,6 +343,50 @@ where
                 right_leaf,
             }),
         })
+    }
+
+    pub fn debug_dump(&self) -> Result<(), Error> {
+        let base = match &self.root {
+            ReadPage::Leaf(l) => {
+                eprintln!("Root Leaf:");
+                eprintln!("{:#?}", l);
+                return Ok(());
+            }
+            ReadPage::Branch(b) => {
+                eprintln!("Root Branch:");
+                eprintln!("{:#?}", b);
+                b
+            }
+        };
+
+        let branch = base.iter();
+        let mut stack = Vec::with_capacity(8);
+        stack.push(branch);
+        loop {
+            let Some(branch) = stack.last_mut() else {
+                return Ok(());
+            };
+            let Some(page) = branch.next() else {
+                stack.pop();
+                continue;
+            };
+            let page_addr = *(page?.1);
+
+            let new_page = unsafe { ReadPage::<B,L>::try_load(self.reader, page_addr)? };
+
+            match new_page {
+                ReadPage::Branch(b) => {
+                    eprintln!("Branch:");
+                    eprintln!("{:#?}", b);
+                    let iter = b.iter();
+                    stack.push(iter);
+                },
+                ReadPage::Leaf(l) => {
+                    eprintln!("Leaf:");
+                    eprintln!("{:#?}", l);
+                },
+            }
+        }
     }
 }
 

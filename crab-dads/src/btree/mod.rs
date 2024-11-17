@@ -513,10 +513,10 @@ mod test {
     }
 
     #[test]
-    fn initial() {
+    fn sequential_insert() {
         let (reader, mut writer) = new_db();
         let mut tree = writer.tree().unwrap();
-        let i_len = 228;
+        let i_len = 10000;
         for i in 0..i_len {
 
             match tree.entry(&i).unwrap() {
@@ -535,6 +535,35 @@ mod test {
         for i in 0..i_len {
             dbg!(i);
             let val = tree.get(&i).unwrap().unwrap();
+            assert_eq!(val, i.to_le_bytes().as_slice());
+        }
+    }
+
+    #[test]
+    fn sequential_insert_rev() {
+        let (reader, mut writer) = new_db();
+        let mut tree = writer.tree().unwrap();
+        let i_len = 227;
+        for i in (0..i_len).rev() {
+
+            match tree.entry(&i).unwrap() {
+                Entry::Occupied(_) => panic!("All entries should be empty right now"),
+                Entry::Vacant(v) => {
+                    v.insert(i.to_le_bytes().as_slice()).unwrap();
+                }
+            }
+        }
+        writer.commit();
+
+        //dbg!(&writer);
+
+        let reader = reader.reload();
+        let tree = reader.tree().unwrap();
+        tree.debug_dump().unwrap();
+        for i in (0..i_len).rev() {
+            let Some(val) = tree.get(&i).expect("no error") else {
+                panic!("expected to get a value for {}", i);
+            };
             assert_eq!(val, i.to_le_bytes().as_slice());
         }
     }
