@@ -144,7 +144,7 @@ where
     B: PageLayout<Value = u64>,
     L: PageLayout<Key = B::Key>,
 {
-    unsafe fn try_load<R: RawRead>(reader: &'a R, page: u64) -> Result<Self, Error> {
+    pub unsafe fn try_load<R: RawRead>(reader: &'a R, page: u64) -> Result<Self, Error> {
         unsafe {
             let page_ptr = reader.load_page(page)?;
             if (page::page_type(page_ptr) & 1) == 1 {
@@ -186,7 +186,7 @@ where
         Q: Ord + ?Sized,
     {
         let mut page: ReadPage<B, L> = self.root.clone();
-        'outer: loop {
+        'outer: for _ in 0..64 {
             match page {
                 ReadPage::Branch(b) => {
                     for result in b.iter().rev() {
@@ -199,6 +199,7 @@ where
                     return Ok(None);
                 }
                 ReadPage::Leaf(l) => {
+                    println!("leaf");
                     for result in l.iter() {
                         let (k, v) = result?;
                         let k: &Q = k.borrow();
@@ -219,6 +220,7 @@ where
                 }
             }
         }
+        Err(Error::DataCorruption("B-Tree depth for `get` is unreasonably large"))
     }
 
     pub fn range<T, RANGE>(&self, range: RANGE) -> Result<BTreeIter<'a, B, L, R>, Error>
@@ -255,7 +257,7 @@ where
             // If we've gone 64 levels deep in a tree, something exceptionally
             // suspicious is happening.
             if left.len() > 64 {
-                return Err(Error::DataCorruption);
+                return Err(Error::DataCorruption("B-Tree depth for left-side iteration is unreasonably large"))
             }
 
             // Fetch the next page address
@@ -293,7 +295,7 @@ where
         let mut right: VecDeque<PageIter<'a, B>> = VecDeque::with_capacity(8);
         let right_leaf = loop {
             if right.len() > 64 {
-                return Err(Error::DataCorruption);
+                return Err(Error::DataCorruption("B-Tree depth for right-side iteration is unreasonably large"))
             }
 
             let page = loop {
@@ -376,15 +378,19 @@ where
 
             match new_page {
                 ReadPage::Branch(b) => {
-                    eprintln!("Branch:");
+                    eprintln!("Branch ({page_addr}):");
                     eprintln!("{:#?}", b);
                     let iter = b.iter();
                     stack.push(iter);
                 },
                 ReadPage::Leaf(l) => {
-                    eprintln!("Leaf:");
+                    eprintln!("Leaf ({page_addr}):");
                     eprintln!("{:#?}", l);
                 },
+            }
+
+            if stack.len() > 64 {
+                return Err(Error::DataCorruption("debug B-Tree depth is unreasonably large"))
             }
         }
     }

@@ -38,7 +38,7 @@ impl<'a> KeyValArray<'a> {
         let val_ptr = self.front.wrapping_add(key_size);
         let new_front = val_ptr.wrapping_add(val_size);
         if new_front > self.back {
-            return Err(Error::DataCorruption);
+            return Err(Error::DataCorruption("advanced past end of lower data region"));
         }
 
         let ret = unsafe {
@@ -62,7 +62,7 @@ impl<'a> KeyValArray<'a> {
         let val_ptr = self.back.wrapping_sub(val_size);
         let new_back = val_ptr.wrapping_sub(key_size);
         if new_back < self.front {
-            return Err(Error::DataCorruption);
+            return Err(Error::DataCorruption("advanced below start of lower data region"));
         }
 
         let ret = unsafe {
@@ -80,7 +80,7 @@ impl<'a> KeyValArray<'a> {
     /// actually exhausted.
     pub fn next_none(&mut self) -> Result<(), Error> {
         if self.back != self.front {
-            return Err(Error::DataCorruption);
+            return Err(Error::DataCorruption("lower data region has unexpected extra bytes"));
         }
         Ok(())
     }
@@ -121,7 +121,7 @@ impl<'a> KeyValArrayMut<'a> {
         let val_ptr = self.front.wrapping_add(key_size);
         let new_front = val_ptr.wrapping_add(val_size);
         if new_front > self.back {
-            return Err(Error::DataCorruption);
+            return Err(Error::DataCorruption("advanced past end of lower data region"));
         }
 
         let ret = unsafe {
@@ -145,7 +145,7 @@ impl<'a> KeyValArrayMut<'a> {
         let val_ptr = self.back.wrapping_sub(val_size);
         let new_back = val_ptr.wrapping_sub(key_size);
         if new_back < self.front {
-            return Err(Error::DataCorruption);
+            return Err(Error::DataCorruption("advanced below start of lower data region"));
         }
 
         let ret = unsafe {
@@ -163,7 +163,7 @@ impl<'a> KeyValArrayMut<'a> {
     /// actually exhausted.
     pub fn next_none(&mut self) -> Result<(), Error> {
         if self.back != self.front {
-            return Err(Error::DataCorruption);
+            return Err(Error::DataCorruption("lower data region has unexpected extra bytes"));
         }
         Ok(())
     }
@@ -210,7 +210,7 @@ impl<'a> KeyValArrayMutResize<'a> {
         let val_ptr = self.back.wrapping_sub(val_size);
         let new_back = val_ptr.wrapping_sub(key_size);
         if new_back < self.front {
-            return Err(Error::DataCorruption);
+            return Err(Error::DataCorruption("advanced below start of lower data region"));
         }
 
         self.back = new_back;
@@ -223,7 +223,7 @@ impl<'a> KeyValArrayMutResize<'a> {
     /// iteration. This returns an error if our iterator isn't actually exhausted.
     pub fn next_pair_back_none(&mut self) -> Result<(), Error> {
         if self.back != self.front {
-            return Err(Error::DataCorruption);
+            return Err(Error::DataCorruption("lower data region has unexpected extra bytes"));
         }
         self.prev_back_key = self.back;
         self.back_val = self.back;

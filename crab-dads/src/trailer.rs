@@ -59,7 +59,7 @@ impl TwoArrayTrailer {
     pub fn lengths<L, U>(&self, space: usize) -> Result<TwoArrayLengths, Error> {
         let ret = unsafe { self.lengths_unchecked() };
         if ret.total::<L, U>() > space {
-            return Err(Error::DataCorruption);
+            return Err(Error::DataCorruption("lengths are too large to fit within a page"));
         }
         Ok(ret)
     }

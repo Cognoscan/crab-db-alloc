@@ -74,8 +74,8 @@ impl<'a, T: PageLayout> PageMap<'a, T> {
             let (k, v) = res?;
             match k.cmp(key) {
                 Ordering::Equal => return Ok(Some((k, v))),
-                Ordering::Greater => (),
-                Ordering::Less => return Ok(None),
+                Ordering::Less => (),
+                Ordering::Greater => return Ok(None),
             }
         }
         Ok(None)
@@ -116,7 +116,7 @@ impl<'a, T: PageLayout> PageMap<'a, T> {
             let (k,_) = res?;
             if let Some(last_key) = last_key {
                 if last_key >= k {
-                    return Err(Error::DataCorruption);
+                    return Err(Error::DataCorruption("Key ordering is incorrect"));
                 }
             }
             last_key = Some(k);

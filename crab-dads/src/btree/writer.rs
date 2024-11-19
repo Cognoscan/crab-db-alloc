@@ -93,18 +93,18 @@ where
 
     /// Turn into a temporary reader
     pub fn as_read(&mut self) -> BTreeRead<'_, B, L, W> {
+        // Clear out any descent into the tree that we'd previously done
+        self.branches.truncate(1);
+
         // Loan out the root page
         let root = if let Some(l) = &self.leaf {
             ReadPage::Leaf(l.0.as_const().clone())
+        } else if let Some(b) = self.branches.last() {
+            ReadPage::Branch(b.0.as_const().clone())
         } else {
-            ReadPage::Branch(
-                self.branches
-                    .first()
-                    .expect("Branch vec must be nonempty")
-                    .0
-                    .as_const()
-                    .clone(),
-            )
+            unsafe {
+                ReadPage::try_load(self.writer, self.root).expect("root page should be valid")
+            }
         };
         unsafe { BTreeRead::from_parts(self.writer, root) }
     }
@@ -162,7 +162,7 @@ where
                     break;
                 }
             }
-            let val = val.ok_or(Error::DataCorruption)?;
+            let val = val.ok_or(Error::DataCorruption("A branch page was somehow empty"))?;
 
             // Load the next page
             let (write_page, write_page_num) = WritePage::<B, L>::try_load(self.writer, *val)?;
@@ -180,7 +180,7 @@ where
             // tree, something is screwy.
             depth += 1;
             if depth > 64 {
-                return Err(Error::DataCorruption);
+                return Err(Error::DataCorruption("unreasonably large B-Tree depth"));
             }
         }
     }
@@ -191,7 +191,9 @@ where
         insert: (&B::Key, u64),
     ) -> Result<(PageMapMut<'a, B>, u64), Error> {
         let page::Entry::Vacant(vacant) = branch.0.entry(insert.0)? else {
-            return Err(Error::DataCorruption);
+            return Err(Error::DataCorruption(
+                "Branch insertion found an occupied entry it was directed to create",
+            ));
         };
         match vacant.insert(&insert.1) {
             Ok(t) => Ok((t.to_page(), branch.1)),
@@ -226,14 +228,15 @@ where
                         );
 
                         // Load in the first page's info
-                        let (k, _) = copy_branch
-                            .0
-                            .as_const()
-                            .iter()
-                            .next()
-                            .ok_or(Error::DataCorruption)??;
+                        let (k, _) = copy_branch.0.as_const().iter().next().ok_or(
+                            Error::DataCorruption("Sub-page for new branch has no entries"),
+                        )??;
                         branch.0 = match branch.0.entry(k)? {
-                            page::Entry::Occupied(_) => return Err(Error::DataCorruption),
+                            page::Entry::Occupied(_) => {
+                                return Err(Error::DataCorruption(
+                                    "brand new branch had occupied entry",
+                                ))
+                            }
                             page::Entry::Vacant(v) => {
                                 v.insert(&old_branch.1).map_err(|(_, e)| e)?.to_page()
                             }
@@ -256,7 +259,9 @@ where
                     new_branch
                 };
                 let page::Entry::Vacant(vacant) = branch.0.entry(insert.0)? else {
-                    return Err(Error::DataCorruption);
+                    return Err(Error::DataCorruption(
+                        "branch insertion expected a branch with a vacancy for the provided key",
+                    ));
                 };
                 branch.0 = vacant.insert(&insert.1).map_err(|(_, e)| e)?.to_page();
                 Ok(branch)
@@ -293,14 +298,19 @@ where
                 let mut branch = (PageMapMut::new(leaf.0.to_page(), page_type), leaf.1);
 
                 // Load in the first page's info
-                let (k, _) = copy_leaf
-                    .0
-                    .as_const()
-                    .iter()
-                    .next()
-                    .ok_or(Error::DataCorruption)??;
+                let (k, _) =
+                    copy_leaf
+                        .0
+                        .as_const()
+                        .iter()
+                        .next()
+                        .ok_or(Error::DataCorruption(
+                            "Sub-leaf for new branch has no entries",
+                        ))??;
                 branch.0 = match branch.0.entry(k)? {
-                    page::Entry::Occupied(_) => return Err(Error::DataCorruption),
+                    page::Entry::Occupied(_) => {
+                        return Err(Error::DataCorruption("brand new branch had occupied entry"))
+                    }
                     page::Entry::Vacant(v) => v.insert(&copy_leaf.1).map_err(|(_, e)| e)?.to_page(),
                 };
                 let b = self.branch_insert(branch, (k2, new_leaf.1))?;
@@ -356,22 +366,32 @@ where
         };
 
         // Extract a pair of pages that are next to each other and can be balanced.
-        let mut v0: Option<u64> = None;
-        let mut prev: Option<(&B::Key, &mut u64)> = None;
+        let mut v0: Option<(&B::Key, &mut u64)> = None;
+        let mut v1: Option<(&B::Key, &mut u64)> = None;
         for res in branch.0.iter_mut().rev() {
             let (k, v) = res?;
-            if k <= key && prev.is_some() {
-                v0 = Some(*v);
+            v1 = v0;
+            v0 = Some((k, v));
+            if k <= key && v1.is_some() {
                 break;
             }
-            prev = Some((k, v));
         }
-        let Some(prev) = prev else {
-            return Ok(());
-        };
         let Some(v0) = v0 else {
             return Ok(());
         };
+        let Some(v1) = v1 else {
+            return Ok(());
+        };
+
+        // Load the pages, replacing the page addresses in the process if needed.
+        let page0 = WritePage::<B, L>::try_load(self.writer, *v0.1)?;
+        let page1 = WritePage::<B, L>::try_load(self.writer, *v1.1)?;
+        if let Some(new_page0) = page0.1 {
+            *v0.1 = new_page0;
+        }
+        if let Some(new_page1) = page1.1 {
+            *v1.1 = new_page1;
+        }
 
         // Try to balance them.
         //
@@ -380,23 +400,27 @@ where
         // it inside the balanced/merged page(s). Otherwise, we'd try to delete
         // an entry by first finding it using the key of that entry.
 
-        let page0 = WritePage::<B, L>::try_load(self.writer, v0)?;
-        let page1 = WritePage::<B, L>::try_load(self.writer, *prev.1)?;
         match (page0.0, page1.0) {
             (WritePage::Branch(b0), WritePage::Branch(b1)) => {
                 match unsafe { b0.balance(b1)? } {
                     Balance::Balanced { lower, higher } => {
                         let lower = lower.as_const();
                         let higher = higher.as_const();
-                        let (new_key, _) = higher.iter().next().ok_or(Error::DataCorruption)??;
+                        let (new_key, _) = higher.iter().next().ok_or(Error::DataCorruption(
+                            "Balanced higher page should still have entries",
+                        ))??;
 
-                        let page_with_key = if prev.0 < new_key { lower } else { higher };
+                        let page_with_key = if v1.0 < new_key { lower } else { higher };
                         let old_key = page_with_key
-                            .get_pair(prev.0)?
-                            .ok_or(Error::DataCorruption)?
+                            .get_pair(v1.0)?
+                            .ok_or(Error::DataCorruption(
+                                "Balanced branch is missing expected pair",
+                            ))?
                             .0;
                         let page::Entry::Occupied(e) = branch.0.entry(old_key)? else {
-                            return Err(Error::DataCorruption);
+                            return Err(Error::DataCorruption(
+                                "Branch holding balanced pages should still have entries for both",
+                            ));
                         };
 
                         // Do the replacement
@@ -405,12 +429,19 @@ where
                         self.branch_insert(branch, (new_key, higher_page_num))?;
                     }
                     Balance::Merged(lower) => {
-                        let freed_page = *prev.1;
+                        let freed_page = *v1.1;
 
                         let lower = lower.as_const();
-                        let old_key = lower.get_pair(prev.0)?.ok_or(Error::DataCorruption)?.0;
+                        let old_key = lower
+                            .get_pair(v1.0)?
+                            .ok_or(Error::DataCorruption(
+                                "Balanced branch is missing expected pair",
+                            ))?
+                            .0;
                         let page::Entry::Occupied(e) = branch.0.entry(old_key)? else {
-                            return Err(Error::DataCorruption);
+                            return Err(Error::DataCorruption(
+                                "Branch holding merged pages should still have entries for both",
+                            ));
                         };
 
                         branch.0 = e.delete();
@@ -428,15 +459,17 @@ where
                     Balance::Balanced { lower, higher } => {
                         let lower = lower.as_const();
                         let higher = higher.as_const();
-                        let (new_key, _) = higher.iter().next().ok_or(Error::DataCorruption)??;
+                        let (new_key, _) = higher.iter().next().ok_or(Error::DataCorruption(
+                            "balanced upper leaf page should not be empty",
+                        ))??;
 
-                        let page_with_key = if prev.0 < new_key { lower } else { higher };
+                        let page_with_key = if v1.0 < new_key { lower } else { higher };
                         let old_key = page_with_key
-                            .get_pair(prev.0)?
-                            .ok_or(Error::DataCorruption)?
+                            .get_pair(v1.0)?
+                            .ok_or(Error::DataCorruption("Balanced leaf pages should still have the old first key of the higher page"))?
                             .0;
                         let page::Entry::Occupied(e) = branch.0.entry(old_key)? else {
-                            return Err(Error::DataCorruption);
+                            return Err(Error::DataCorruption("Branch holding balanced pages should still have old key of the upper page"));
                         };
 
                         // Do the replacement
@@ -445,12 +478,17 @@ where
                         self.branch_insert(branch, (new_key, higher_page_num))?;
                     }
                     Balance::Merged(lower) => {
-                        let freed_page = *prev.1;
+                        let freed_page = *v1.1;
 
                         let lower = lower.as_const();
-                        let old_key = lower.get_pair(prev.0)?.ok_or(Error::DataCorruption)?.0;
+                        let old_key = lower
+                            .get_pair(v1.0)?
+                            .ok_or(Error::DataCorruption(
+                                "Balanced branch is missing expected pair",
+                            ))?
+                            .0;
                         let page::Entry::Occupied(e) = branch.0.entry(old_key)? else {
-                            return Err(Error::DataCorruption);
+                            return Err(Error::DataCorruption("Branch holding merged pages should still have old key of the upper page"));
                         };
 
                         branch.0 = e.delete();
@@ -463,7 +501,11 @@ where
                     }
                 }
             }
-            _ => return Err(Error::DataCorruption),
+            _ => {
+                return Err(Error::DataCorruption(
+                    "Found a branch and a leaf page sharing the same hierarchy level in the tree",
+                ))
+            }
         }
         Ok(())
     }
@@ -515,8 +557,10 @@ where
         let first = self.entry.first();
         let mut page = self.entry.delete();
         if first {
-            let (new_key, _) = page.iter_mut().next().ok_or(Error::DataCorruption)??;
-            self.tree.replace_branch_first(self.key, new_key)?;
+            if let Some(new) = page.iter_mut().next() {
+                let (new_key, _) = new?;
+                self.tree.replace_branch_first(self.key, new_key)?;
+            }
         }
 
         // Check if we have a page that's a good candidate for rebalancing.

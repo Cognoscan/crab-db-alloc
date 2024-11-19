@@ -52,7 +52,7 @@ pub enum Error {
     /// Out of space; needed at least N bytes.
     OutofSpace(usize),
     /// Data format on disk was corrupted somehow.
-    DataCorruption,
+    DataCorruption(&'static str),
     /// A requested write operation was too large to fit within the disk map.
     WriteTooLarge,
     /// Storage system-related error.
@@ -80,7 +80,7 @@ impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::OutofSpace(s) => write!(f, "No space left in page to insert, needed {s} bytes"),
-            Self::DataCorruption => f.write_str("Data Corruption"),
+            Self::DataCorruption(s) => write!(f, "Data Corruption: {}", s),
             Self::WriteTooLarge => f.write_str("Provided Key/Value is too large to fit in the map"),
             Self::Storage(_) => f.write_str("Storage system error"),
             Self::UnexpectedNoOp => f.write_str(

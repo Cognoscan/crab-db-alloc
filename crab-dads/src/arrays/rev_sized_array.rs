@@ -41,7 +41,7 @@ impl<'a, T: CheckedBitPattern> Iterator for RevSizedArray<'a, T> {
         unsafe {
             self.front = self.front.sub(1);
             if !T::is_valid_bit_pattern(&*(self.front as *const T::Bits)) {
-                return Some(Err(Error::DataCorruption));
+                return Some(Err(Error::DataCorruption("Invalid bit pattern for sized upper array")));
             }
             Some(Ok(&*self.front))
         }
@@ -64,7 +64,7 @@ impl<'a, T: CheckedBitPattern> DoubleEndedIterator for RevSizedArray<'a, T> {
         }
         unsafe {
             if !T::is_valid_bit_pattern(&*(self.back as *const T::Bits)) {
-                return Some(Err(Error::DataCorruption));
+                return Some(Err(Error::DataCorruption("Invalid bit pattern for sized upper array")));
             }
             let ret = &*self.back;
             self.back = self.back.add(1);
@@ -108,7 +108,7 @@ impl<'a, T: CheckedBitPattern> Iterator for RevSizedArrayMut<'a, T> {
         unsafe {
             self.front = self.front.sub(1);
             if !T::is_valid_bit_pattern(&*(self.front as *const T::Bits)) {
-                return Some(Err(Error::DataCorruption));
+                return Some(Err(Error::DataCorruption("Invalid bit pattern for sized upper array")));
             }
             Some(Ok(&mut *self.front))
         }
@@ -131,7 +131,7 @@ impl<'a, T: CheckedBitPattern> DoubleEndedIterator for RevSizedArrayMut<'a, T> {
         }
         unsafe {
             if !T::is_valid_bit_pattern(&*(self.back as *const T::Bits)) {
-                return Some(Err(Error::DataCorruption));
+                return Some(Err(Error::DataCorruption("Invalid bit pattern for sized upper array")));
             }
             let ret = &mut *self.back;
             self.back = self.back.add(1);
@@ -241,7 +241,7 @@ impl<'a, T: CheckedBitPattern> RevSizedArrayMutResize<'a, T> {
         unsafe {
             let ret = &mut *self.back;
             if !T::is_valid_bit_pattern(&*(self.back as *const T::Bits)) {
-                return Some(Err(Error::DataCorruption));
+                return Some(Err(Error::DataCorruption("Invalid bit pattern for sized upper array")));
             }
             self.back = self.back.add(1);
             Some(Ok(ret))

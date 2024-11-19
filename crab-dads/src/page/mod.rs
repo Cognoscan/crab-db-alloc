@@ -120,7 +120,8 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                 let pair_len = pair_info.key_len() + pair_info.value_len();
                 let add_len = pair_len + core::mem::size_of::<T>();
                 if (add_len + move_amount) > target {
-                    let mut new_upper_len_bytes = lengths.upper_bytes::<T>() - info.remaining_bytes();
+                    let mut new_upper_len_bytes =
+                        lengths.upper_bytes::<T>() - info.remaining_bytes();
                     // Determine if we actually take this final key-value pair or
                     // not. Choose whatever gets us closer to an even split.
                     if ((add_len + move_amount - target) > (target - move_amount))
@@ -133,7 +134,7 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                         taken_lower += pair_len;
                     }
                     if taken_lower > lengths.lower {
-                        return Err(Error::DataCorruption);
+                        return Err(Error::DataCorruption("Page cutpoint took more bytes than are in the lower page region"));
                     }
                     return Ok(Cutpoint {
                         lower_len: taken_lower,
@@ -186,8 +187,14 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
             new_trailer.set_lower_len(split_lower_len as u16);
             new_trailer.set_upper_len((split_upper_len_bytes / core::mem::size_of::<T>()) as u16);
 
-            debug_assert!(self.as_const().verify().is_ok(), "newly split page should be valid");
-            debug_assert!(new_page.as_const().verify().is_ok(), "split-up page should be valid");
+            debug_assert!(
+                self.as_const().verify().is_ok(),
+                "newly split page should be valid"
+            );
+            debug_assert!(
+                new_page.as_const().verify().is_ok(),
+                "split-up page should be valid"
+            );
 
             Ok(new_page)
         }
@@ -210,12 +217,19 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
         mut self,
         mut higher: PageMapMut<'b, T>,
     ) -> Result<Balance<'a, 'b, T>, Error> {
+        #[cfg(debug_assertions)]
+        {
+            let max0 = self.as_const().iter().next_back();
+            let min1 = higher.as_const().iter().next();
+            if let (Some(Ok((k0, _))), Some(Ok((k1, _)))) = (max0, min1) {
+                debug_assert!(k0 < k1, "higher-numbered page fed to balancing function has a key lower than the highest key in this page, k0 = {k0:?}, k1 = {k1:?}");
+            }
+        }
         unsafe {
             let self_len = self.data_len();
             let higher_len = higher.data_len();
 
             if (self_len + higher_len) < CONTENT_SIZE {
-                // Merge
 
                 // Copy the data
                 let self_len = self.page_trailer().lengths_unchecked();
@@ -237,6 +251,10 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                 let trailer = self.page_trailer_mut();
                 trailer.add_to_lower_len(higher_len.lower as isize);
                 trailer.add_to_upper_len(higher_len.upper as isize);
+                debug_assert!(trailer.lengths::<u8,T>(CONTENT_SIZE).is_ok());
+
+                // Verify after changing
+                debug_assert!(self.as_const().verify().is_ok(), "merged page should still be valid");
 
                 Ok(Balance::Merged(self))
             } else if self_len > higher_len {
@@ -272,19 +290,29 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                     self.page.add(CONTENT_SIZE - self_len.upper_bytes::<T>()),
                     higher
                         .page
-                        .add(CONTENT_SIZE - higher_upper_bytes - cutpoint.upper_bytes),
+                        .add(CONTENT_SIZE - cutpoint.upper_bytes),
                     cutpoint.upper_bytes,
                 );
 
-                // Update everyone's lengths
+                // Calculate the changes to the lengths
                 let lower_delta = cutpoint.lower_len as isize;
                 let upper_delta = (cutpoint.upper_bytes / core::mem::size_of::<T>()) as isize;
+
+                // Update the lower page's lengths
                 let trailer = self.page_trailer_mut();
                 trailer.add_to_lower_len(-lower_delta);
                 trailer.add_to_upper_len(-upper_delta);
+                debug_assert!(trailer.lengths::<u8,T>(CONTENT_SIZE).is_ok());
+
+                // Update the higher page's lengths
                 let trailer = higher.page_trailer_mut();
                 trailer.add_to_lower_len(lower_delta);
                 trailer.add_to_upper_len(upper_delta);
+                debug_assert!(trailer.lengths::<u8,T>(CONTENT_SIZE).is_ok());
+
+                // Verify after changing
+                debug_assert!(self.as_const().verify().is_ok(), "balanced lower page should still be valid");
+                debug_assert!(higher.as_const().verify().is_ok(), "balanced higher page should still be valid");
 
                 Ok(Balance::Balanced {
                     lower: self,
@@ -310,7 +338,7 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                     higher_len.lower - cutpoint.lower_len,
                 );
 
-                // Make room and then copy the upper data
+                // Copy the upper data, then delete it from the higher page
                 let higher_upper_bytes = higher_len.upper_bytes::<T>();
                 let self_upper_bytes = self_len.upper_bytes::<T>();
                 core::ptr::copy_nonoverlapping(
@@ -324,18 +352,28 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                     higher
                         .page
                         .add(CONTENT_SIZE - higher_upper_bytes + cutpoint.upper_bytes),
-                    higher_upper_bytes,
+                    higher_upper_bytes - cutpoint.upper_bytes,
                 );
 
-                // Update everyone's lengths
+                // Calculate the changes to the lengths
                 let lower_delta = cutpoint.lower_len as isize;
                 let upper_delta = (cutpoint.upper_bytes / core::mem::size_of::<T>()) as isize;
+
+                // Update this page's lengths
                 let trailer = self.page_trailer_mut();
                 trailer.add_to_lower_len(lower_delta);
                 trailer.add_to_upper_len(upper_delta);
+                debug_assert!(trailer.lengths::<u8,T>(CONTENT_SIZE).is_ok());
+
+                // Update the higher page's lengths
                 let trailer = higher.page_trailer_mut();
                 trailer.add_to_lower_len(-lower_delta);
                 trailer.add_to_upper_len(-upper_delta);
+                debug_assert!(trailer.lengths::<u8,T>(CONTENT_SIZE).is_ok());
+
+                // Verify after changing
+                debug_assert!(self.as_const().verify().is_ok(), "balanced lower page should still be valid");
+                debug_assert!(higher.as_const().verify().is_ok(), "balanced higher page should still be valid");
 
                 Ok(Balance::Balanced {
                     lower: self,
@@ -539,7 +577,6 @@ pub struct OccupiedEntry<'a, T: PageLayout> {
 }
 
 impl<'a, T: PageLayout> OccupiedEntry<'a, T> {
-
     /// Returns true if this is the first entry in the page.
     pub fn first(&self) -> bool {
         self.first
@@ -651,7 +688,6 @@ pub struct VacantEntry<'a, 'k, T: PageLayout> {
 }
 
 impl<'a, 'k, T: PageLayout> VacantEntry<'a, 'k, T> {
-
     /// Get if this will become the first entry in the page when inserted into.
     pub fn first(&self) -> bool {
         self.first

@@ -164,7 +164,7 @@ pub unsafe trait RawWrite: RawRead {
 #[allow(dead_code)]
 mod test {
     extern crate std;
-    use core::{alloc::GlobalAlloc, cell::UnsafeCell};
+    use core::cell::UnsafeCell;
     use std::prelude::rust_2021::*;
     use std::sync::RwLock;
 
@@ -429,9 +429,11 @@ mod test {
     unsafe impl RawRead for BasicDbWrite {
         unsafe fn load(&self, page: u64, num_pages: usize) -> Result<&[u8], StorageError> {
             let inner = self.inner.read().unwrap();
+            let cell: &BasicDbWriteCell = unsafe { &*self.cell.get() };
             let mem = inner
                 .memory
                 .get(&page)
+                .or_else(|| cell.dirty.get(&page))
                 .ok_or(StorageError::OutOfRange(page))?;
             if mem.len() != (num_pages * PAGE_4K) {
                 return Err(StorageError::Corruption(
@@ -513,12 +515,13 @@ mod test {
     }
 
     #[test]
-    fn sequential_insert() {
+    fn sequential_insert_forward() {
         let (reader, mut writer) = new_db();
         let mut tree = writer.tree().unwrap();
-        let i_len = 10000;
-        for i in 0..i_len {
+        let i_len = 29500;
 
+        // Insertion
+        for i in 0..i_len {
             match tree.entry(&i).unwrap() {
                 Entry::Occupied(_) => panic!("All entries should be empty right now"),
                 Entry::Vacant(v) => {
@@ -527,15 +530,43 @@ mod test {
             }
         }
         writer.commit();
+        println!("Writing complete");
 
-        dbg!(&writer);
+        // Post-insert check
+        let reader = reader.reload();
+        let tree = reader.tree().unwrap();
+        tree.debug_dump().unwrap();
+        for i in 0..i_len {
+            println!("{i}");
+            let val = tree.get(&i).unwrap().unwrap();
+            assert_eq!(val, i.to_le_bytes().as_slice());
+        }
+        let mut iter = tree.range(..).unwrap();
+        for i in 0..i_len {
+            let (k,v) = iter.next().expect("should've gotten a pair").expect("Didn't expect an error");
+            assert_eq!(*k, i);
+            assert_eq!(v, i.to_le_bytes().as_slice());
+        }
+        println!("Reading complete");
 
+        // Deletion
+        let mut tree = writer.tree().unwrap();
+        for i in 0..i_len {
+            match tree.entry(&i).unwrap() {
+                Entry::Vacant(_) => panic!("All entries should be occupied"),
+                Entry::Occupied(o) => {
+                    o.delete().unwrap_or_else(|e| panic!("Entry for {i} should be deletable: {}", e));
+                }
+            }
+        }
+        writer.commit();
+        println!("Deletion complete");
+
+        // Post-delete check
         let reader = reader.reload();
         let tree = reader.tree().unwrap();
         for i in 0..i_len {
-            dbg!(i);
-            let val = tree.get(&i).unwrap().unwrap();
-            assert_eq!(val, i.to_le_bytes().as_slice());
+            assert!(tree.get(&i).unwrap().is_none());
         }
     }
 
@@ -543,7 +574,9 @@ mod test {
     fn sequential_insert_rev() {
         let (reader, mut writer) = new_db();
         let mut tree = writer.tree().unwrap();
-        let i_len = 227;
+        let i_len = 10000;
+
+        // Insertion
         for i in (0..i_len).rev() {
 
             match tree.entry(&i).unwrap() {
@@ -555,8 +588,7 @@ mod test {
         }
         writer.commit();
 
-        //dbg!(&writer);
-
+        // Post-insert check
         let reader = reader.reload();
         let tree = reader.tree().unwrap();
         tree.debug_dump().unwrap();
@@ -565,6 +597,32 @@ mod test {
                 panic!("expected to get a value for {}", i);
             };
             assert_eq!(val, i.to_le_bytes().as_slice());
+        }
+        let mut iter = tree.range(..).unwrap();
+        for i in (0..i_len).rev() {
+            let (k,v) = iter.next_back().expect("should've gotten a pair").expect("Didn't expect an error");
+            assert_eq!(*k, i);
+            assert_eq!(v, i.to_le_bytes().as_slice());
+        }
+
+        // Deletion
+        let mut tree = writer.tree().unwrap();
+        for i in (0..i_len).rev() {
+            match tree.entry(&i).unwrap() {
+                Entry::Vacant(_) => panic!("All entries should be occupied"),
+                Entry::Occupied(o) => {
+                    o.delete().unwrap_or_else(|e| panic!("Entry for {i} should be deletable: {}", e));
+                }
+            }
+        }
+        writer.commit();
+        println!("Deletion complete");
+
+        // Post-delete check
+        let reader = reader.reload();
+        let tree = reader.tree().unwrap();
+        for i in (0..i_len).rev() {
+            assert!(tree.get(&i).unwrap().is_none());
         }
     }
 }
