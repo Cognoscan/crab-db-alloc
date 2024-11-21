@@ -14,7 +14,7 @@ use super::RawRead;
 
 fn trim_leaf<'a, I, R, K, V, Q>(iter: &mut I, range: &R) -> Result<(), Error>
 where
-    I: Iterator<Item = Result<(&'a K, &'a V), Error>> + Clone,
+    I: Iterator<Item = Result<(&'a K, &'a V), Error>> + DoubleEndedIterator + Clone,
     R: RangeBounds<Q>,
     K: Borrow<Q> + Ord + ?Sized + 'a,
     V: ?Sized + 'a,
@@ -42,7 +42,7 @@ where
 
     // Trim the back
     let mut peek = iter.clone();
-    while let Some(result) = peek.next() {
+    while let Some(result) = peek.next_back() {
         let (k, _) = result?;
         match range.end_bound() {
             Bound::Unbounded => break,
@@ -65,9 +65,9 @@ where
 
 fn trim_branch<'a, I, R, K, V, Q>(iter: &mut I, range: &R) -> Result<(), Error>
 where
-    I: Iterator<Item = Result<(&'a K, &'a V), Error>> + Clone,
+    I: Iterator<Item = Result<(&'a K, &'a V), Error>> + DoubleEndedIterator + Clone,
     R: RangeBounds<Q>,
-    K: Borrow<Q> + Ord + ?Sized + 'a,
+    K: Borrow<Q> + Ord + ?Sized + core::fmt::Debug + 'a,
     V: ?Sized + 'a,
     Q: Ord + ?Sized,
 {
@@ -82,14 +82,14 @@ where
         match range.start_bound() {
             Bound::Unbounded => break,
             Bound::Excluded(b) | Bound::Included(b) => {
-                let k: &Q = k.borrow();
-                match k.cmp(b) {
-                    Ordering::Greater => (),
+                let k_borrow: &Q = k.borrow();
+                match k_borrow.cmp(b) {
+                    Ordering::Less => (),
                     Ordering::Equal => {
                         *iter = peek;
                         break;
                     }
-                    Ordering::Less => break,
+                    Ordering::Greater => break,
                 }
             }
         }
@@ -98,7 +98,7 @@ where
 
     // Trim the back
     let mut peek = iter.clone();
-    while let Some(result) = peek.next() {
+    while let Some(result) = peek.next_back() {
         let (k, _) = result?;
         match range.end_bound() {
             Bound::Unbounded => break,
@@ -199,7 +199,6 @@ where
                     return Ok(None);
                 }
                 ReadPage::Leaf(l) => {
-                    println!("leaf");
                     for result in l.iter() {
                         let (k, v) = result?;
                         let k: &Q = k.borrow();
@@ -220,7 +219,9 @@ where
                 }
             }
         }
-        Err(Error::DataCorruption("B-Tree depth for `get` is unreasonably large"))
+        Err(Error::DataCorruption(
+            "B-Tree depth for `get` is unreasonably large",
+        ))
     }
 
     pub fn range<T, RANGE>(&self, range: RANGE) -> Result<BTreeIter<'a, B, L, R>, Error>
@@ -257,7 +258,9 @@ where
             // If we've gone 64 levels deep in a tree, something exceptionally
             // suspicious is happening.
             if left.len() > 64 {
-                return Err(Error::DataCorruption("B-Tree depth for left-side iteration is unreasonably large"))
+                return Err(Error::DataCorruption(
+                    "B-Tree depth for left-side iteration is unreasonably large",
+                ));
             }
 
             // Fetch the next page address
@@ -295,7 +298,9 @@ where
         let mut right: VecDeque<PageIter<'a, B>> = VecDeque::with_capacity(8);
         let right_leaf = loop {
             if right.len() > 64 {
-                return Err(Error::DataCorruption("B-Tree depth for right-side iteration is unreasonably large"))
+                return Err(Error::DataCorruption(
+                    "B-Tree depth for right-side iteration is unreasonably large",
+                ));
             }
 
             let page = loop {
@@ -352,6 +357,58 @@ where
             ReadPage::Leaf(l) => {
                 eprintln!("Root Leaf:");
                 eprintln!("{:#?}", l);
+                l.verify().unwrap();
+                return Ok(());
+            }
+            ReadPage::Branch(b) => {
+                eprintln!("Root Branch:");
+                eprintln!("{:#?}", b);
+                b.verify().unwrap();
+                b
+            }
+        };
+
+        let branch = base.iter();
+        let mut stack = Vec::with_capacity(8);
+        stack.push(branch);
+        loop {
+            let Some(branch) = stack.last_mut() else {
+                return Ok(());
+            };
+            let Some(page) = branch.next() else {
+                stack.pop();
+                continue;
+            };
+            let page_addr = *(page?.1);
+
+            let new_page = unsafe { ReadPage::<B, L>::try_load(self.reader, page_addr)? };
+
+            match new_page {
+                ReadPage::Branch(b) => {
+                    eprintln!("Branch ({page_addr}):");
+                    eprintln!("{:#?}", b);
+                    b.verify().unwrap();
+                    let iter = b.iter();
+                    stack.push(iter);
+                }
+                ReadPage::Leaf(l) => {
+                    eprintln!("Leaf ({page_addr}):");
+                    eprintln!("{:#?}", l);
+                    l.verify().unwrap();
+                }
+            }
+
+            if stack.len() > 64 {
+                return Err(Error::DataCorruption(
+                    "debug B-Tree depth is unreasonably large",
+                ));
+            }
+        }
+    }
+
+    pub fn debug_dump_branches(&self) -> Result<(), Error> {
+        let base = match &self.root {
+            ReadPage::Leaf(_) => {
                 return Ok(());
             }
             ReadPage::Branch(b) => {
@@ -374,7 +431,7 @@ where
             };
             let page_addr = *(page?.1);
 
-            let new_page = unsafe { ReadPage::<B,L>::try_load(self.reader, page_addr)? };
+            let new_page = unsafe { ReadPage::<B, L>::try_load(self.reader, page_addr)? };
 
             match new_page {
                 ReadPage::Branch(b) => {
@@ -382,15 +439,14 @@ where
                     eprintln!("{:#?}", b);
                     let iter = b.iter();
                     stack.push(iter);
-                },
-                ReadPage::Leaf(l) => {
-                    eprintln!("Leaf ({page_addr}):");
-                    eprintln!("{:#?}", l);
-                },
+                }
+                ReadPage::Leaf(_) => {}
             }
 
             if stack.len() > 64 {
-                return Err(Error::DataCorruption("debug B-Tree depth is unreasonably large"))
+                return Err(Error::DataCorruption(
+                    "debug B-Tree depth is unreasonably large",
+                ));
             }
         }
     }

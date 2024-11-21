@@ -272,7 +272,7 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                     higher_len.lower,
                 );
                 core::ptr::copy_nonoverlapping(
-                    self.page.add(cutpoint.lower_len),
+                    self.page.add(self_len.lower - cutpoint.lower_len),
                     higher.page,
                     cutpoint.lower_len,
                 );

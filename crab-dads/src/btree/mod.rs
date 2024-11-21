@@ -368,11 +368,19 @@ mod test {
             .field("root", &self.root)
             .field("page_num", &self.page_num)
             .field("dirty", &MemoryFmt(&self.dirty))
+            .field("to_drop", &self.to_drop)
             .finish_non_exhaustive()
         }
     }
 
     impl BasicDbWrite {
+
+        fn page_count(&self) -> usize {
+            let mem_len = self.inner.read().unwrap().memory.len();
+            let dirty_len = unsafe { (*self.cell.get()).dirty.len() };
+            mem_len + dirty_len
+        }
+
         fn commit(&mut self) {
             let mut inner = self.inner.write().unwrap();
 
@@ -518,7 +526,7 @@ mod test {
     fn sequential_insert_forward() {
         let (reader, mut writer) = new_db();
         let mut tree = writer.tree().unwrap();
-        let i_len = 29500;
+        let i_len = 100000;
 
         // Insertion
         for i in 0..i_len {
@@ -530,14 +538,12 @@ mod test {
             }
         }
         writer.commit();
-        println!("Writing complete");
+        println!("Writing complete, {} pages used", writer.page_count());
 
         // Post-insert check
         let reader = reader.reload();
         let tree = reader.tree().unwrap();
-        tree.debug_dump().unwrap();
         for i in 0..i_len {
-            println!("{i}");
             let val = tree.get(&i).unwrap().unwrap();
             assert_eq!(val, i.to_le_bytes().as_slice());
         }
@@ -547,6 +553,14 @@ mod test {
             assert_eq!(*k, i);
             assert_eq!(v, i.to_le_bytes().as_slice());
         }
+        let mut iter = tree.range(1000..50000).unwrap();
+        for i in 1000..50000 {
+            let (k,v) = iter.next().expect("should've gotten a pair").expect("Didn't expect an error");
+            assert_eq!(*k, i);
+            assert_eq!(v, i.to_le_bytes().as_slice());
+        }
+        assert!(iter.next().is_none(), "forward iterator should have ended exactly when we did");
+        assert!(iter.next_back().is_none(), "backward iterator should have ended exactly when we did");
         println!("Reading complete");
 
         // Deletion
@@ -560,10 +574,13 @@ mod test {
             }
         }
         writer.commit();
-        println!("Deletion complete");
+        let reader = reader.reload();
+        writer.commit();
+        let reader = reader.reload();
+        writer.commit();
+        println!("Deletion complete, {} pages used", writer.page_count());
 
         // Post-delete check
-        let reader = reader.reload();
         let tree = reader.tree().unwrap();
         for i in 0..i_len {
             assert!(tree.get(&i).unwrap().is_none());
@@ -574,7 +591,7 @@ mod test {
     fn sequential_insert_rev() {
         let (reader, mut writer) = new_db();
         let mut tree = writer.tree().unwrap();
-        let i_len = 10000;
+        let i_len = 100000;
 
         // Insertion
         for i in (0..i_len).rev() {
@@ -587,11 +604,11 @@ mod test {
             }
         }
         writer.commit();
+        println!("Writing complete, {} pages used", writer.page_count());
 
         // Post-insert check
         let reader = reader.reload();
         let tree = reader.tree().unwrap();
-        tree.debug_dump().unwrap();
         for i in (0..i_len).rev() {
             let Some(val) = tree.get(&i).expect("no error") else {
                 panic!("expected to get a value for {}", i);
@@ -600,23 +617,44 @@ mod test {
         }
         let mut iter = tree.range(..).unwrap();
         for i in (0..i_len).rev() {
-            let (k,v) = iter.next_back().expect("should've gotten a pair").expect("Didn't expect an error");
+            let (k,v) = match iter.next_back() {
+                Some(Ok(p)) => p,
+                Some(Err(e)) => panic!("Didn't expect error for item {i}: {e}"),
+                None => panic!("Should've gotten a pair for item {i}"),
+            };
             assert_eq!(*k, i);
             assert_eq!(v, i.to_le_bytes().as_slice());
         }
+        let mut iter = tree.range(1000..50000).unwrap();
+        for i in (1000..50000).rev() {
+            let (k,v) = match iter.next_back() {
+                Some(Ok(p)) => p,
+                Some(Err(e)) => panic!("Didn't expect error for item {i}: {e}"),
+                None => panic!("Should've gotten a pair for item {i}"),
+            };
+            assert_eq!(*k, i);
+            assert_eq!(v, i.to_le_bytes().as_slice());
+        }
+        assert!(iter.next_back().is_none(), "backward iterator should have ended exactly when we did");
+        assert!(iter.next().is_none(), "forward iterator should have ended exactly when we did");
+        println!("Reading complete");
 
         // Deletion
         let mut tree = writer.tree().unwrap();
         for i in (0..i_len).rev() {
             match tree.entry(&i).unwrap() {
-                Entry::Vacant(_) => panic!("All entries should be occupied"),
+                Entry::Vacant(_) => panic!("All entries should be occupied, but {i} is unoccupied"),
                 Entry::Occupied(o) => {
                     o.delete().unwrap_or_else(|e| panic!("Entry for {i} should be deletable: {}", e));
                 }
             }
         }
         writer.commit();
-        println!("Deletion complete");
+        let reader = reader.reload();
+        writer.commit();
+        let reader = reader.reload();
+        writer.commit();
+        println!("Deletion complete, {} pages used", writer.page_count());
 
         // Post-delete check
         let reader = reader.reload();

@@ -44,10 +44,12 @@ where
                     if (page::page_type(read) & 1) == 1 {
                         let read: PageMap<'a, L> = PageMap::from_page(read)?;
                         let write = read.copy_to(write);
+                        writer.deallocate_page(page)?;
                         Ok((WritePage::Leaf(write), Some(write_page)))
                     } else {
                         let read: PageMap<'a, B> = PageMap::from_page(read)?;
                         let write = read.copy_to(write);
+                        writer.deallocate_page(page)?;
                         Ok((WritePage::Branch(write), Some(write_page)))
                     }
                 }
@@ -190,84 +192,91 @@ where
         branch: (PageMapMut<'a, B>, u64),
         insert: (&B::Key, u64),
     ) -> Result<(PageMapMut<'a, B>, u64), Error> {
+        // Try and do the insertion normally first
         let page::Entry::Vacant(vacant) = branch.0.entry(insert.0)? else {
             return Err(Error::DataCorruption(
                 "Branch insertion found an occupied entry it was directed to create",
             ));
         };
-        match vacant.insert(&insert.1) {
-            Ok(t) => Ok((t.to_page(), branch.1)),
-            Err((t, Error::OutofSpace(_))) => {
-                let new_branch = self.writer.allocate_page()?;
-                let mut old_branch = (t.to_page(), branch.1);
-                let new_branch = (old_branch.0.split_to(new_branch.0)?, new_branch.1);
-                let (k2, _) = new_branch
-                    .0
-                    .as_const()
-                    .iter()
-                    .next()
-                    .ok_or(Error::InvalidState("split branch shouldn't be empty"))??;
+        let vacant = match vacant.insert(&insert.1) {
+            Ok(t) => return Ok((t.to_page(), branch.1)),
+            Err((t, Error::OutofSpace(_))) => t,
+            Err((_, e)) => return Err(e),
+        };
 
-                // Insert into the next level up
-                let old_branch = match self.branches.pop() {
-                    None => {
-                        // Root page. To keep the root page at the same page
-                        // number, we've got to copy it over to a new page, then
-                        // put both that new page and the higher page in.
-                        let copy_branch = self.writer.allocate_page()?;
-                        let copy_branch = (
-                            old_branch.0.as_const().copy_to(copy_branch.0),
-                            copy_branch.1,
-                        );
-                        let page_type = old_branch.0.page_trailer().page_type;
+        // Branch is out of space, time to split it up
 
-                        // Create the branch
-                        let mut branch = (
-                            PageMapMut::new(old_branch.0.to_page(), page_type),
-                            old_branch.1,
-                        );
+        let new_branch = self.writer.allocate_page()?;
+        let mut old_branch = (vacant.to_page(), branch.1);
+        let new_branch = (old_branch.0.split_to(new_branch.0)?, new_branch.1);
+        let (k2, _) = new_branch
+            .0
+            .as_const()
+            .iter()
+            .next()
+            .ok_or(Error::InvalidState("split branch shouldn't be empty"))??;
 
-                        // Load in the first page's info
-                        let (k, _) = copy_branch.0.as_const().iter().next().ok_or(
-                            Error::DataCorruption("Sub-page for new branch has no entries"),
-                        )??;
-                        branch.0 = match branch.0.entry(k)? {
-                            page::Entry::Occupied(_) => {
-                                return Err(Error::DataCorruption(
-                                    "brand new branch had occupied entry",
-                                ))
-                            }
-                            page::Entry::Vacant(v) => {
-                                v.insert(&old_branch.1).map_err(|(_, e)| e)?.to_page()
-                            }
-                        };
-                        let b = self.branch_insert(branch, (k2, new_branch.1))?;
-                        self.branches.push(b);
-                        copy_branch
+        // Insert into the next level up
+        let old_branch = match self.branches.pop() {
+            None => {
+                // Root page. To keep the root page at the same page
+                // number, we've got to copy it over to a new page, then
+                // put both that new page and the higher page in.
+                let copy_branch = self.writer.allocate_page()?;
+                let copy_branch = (
+                    old_branch.0.as_const().copy_to(copy_branch.0),
+                    copy_branch.1,
+                );
+                let page_type = old_branch.0.page_trailer().page_type;
+
+                // Create the branch
+                let mut root_branch = (
+                    PageMapMut::new(old_branch.0.to_page(), page_type),
+                    old_branch.1,
+                );
+
+                // Load in the first page's info
+                let (k, _) =
+                    copy_branch
+                        .0
+                        .as_const()
+                        .iter()
+                        .next()
+                        .ok_or(Error::DataCorruption(
+                            "Sub-page for new branch has no entries",
+                        ))??;
+                root_branch.0 = match root_branch.0.entry(k)? {
+                    page::Entry::Occupied(_) => {
+                        return Err(Error::DataCorruption("brand new branch had occupied entry"))
                     }
-                    Some(b) => {
-                        let b = self.branch_insert(b, (k2, new_branch.1))?;
-                        self.branches.push(b);
-                        old_branch
+                    page::Entry::Vacant(v) => {
+                        v.insert(&copy_branch.1).map_err(|(_, e)| e)?.to_page()
                     }
                 };
-
-                // Complete the update
-                let mut branch = if insert.0 < k2 {
-                    old_branch
-                } else {
-                    new_branch
-                };
-                let page::Entry::Vacant(vacant) = branch.0.entry(insert.0)? else {
-                    return Err(Error::DataCorruption(
-                        "branch insertion expected a branch with a vacancy for the provided key",
-                    ));
-                };
-                branch.0 = vacant.insert(&insert.1).map_err(|(_, e)| e)?.to_page();
-                Ok(branch)
+                let b = self.branch_insert(root_branch, (k2, new_branch.1))?;
+                self.branches.push(b);
+                copy_branch
             }
-            Err((_, e)) => Err(e),
-        }
+            Some(b) => {
+                let b = self.branch_insert(b, (k2, new_branch.1))?;
+                self.branches.push(b);
+                old_branch
+            }
+        };
+
+        // Complete the update
+        let mut branch = if insert.0 < k2 {
+            old_branch
+        } else {
+            new_branch
+        };
+        let page::Entry::Vacant(vacant) = branch.0.entry(insert.0)? else {
+            return Err(Error::DataCorruption(
+                "branch insertion expected a branch with a vacancy for the provided key",
+            ));
+        };
+        branch.0 = vacant.insert(&insert.1).map_err(|(_, e)| e)?.to_page();
+        Ok(branch)
     }
 
     fn split_leaf(
@@ -330,39 +339,92 @@ where
     }
 
     fn replace_branch_first(&mut self, old_key: &L::Key, new_key: &L::Key) -> Result<(), Error> {
-        let Some((b, b_num)) = self.branches.pop() else {
+        let Some(branch) = self.branches.pop() else {
             return Ok(());
         };
 
         // Replace our own branch's key-value pair
-        let e = match b.entry(old_key)? {
+        let e = match branch.0.entry(old_key)? {
             page::Entry::Occupied(e) => e,
             page::Entry::Vacant(v) => {
-                self.branches.push((v.to_page(), b_num));
+                self.branches.push((v.to_page(), branch.1));
                 return Ok(());
             }
         };
+        let first = e.first();
         let page = *e.get();
-        let b = e.delete();
+        let branch = (e.delete(), branch.1);
 
         // Calling branch_insert will automatically handle expanding and
         // splitting branch pages as needed.
-        let b = self.branch_insert((b, b_num), (new_key, page))?;
+        let branch = self.branch_insert(branch, (new_key, page))?;
 
-        // Recurse down, replacing the first key-value pair on every branch
-        self.replace_branch_first(old_key, new_key)?;
+        // Recurse down, replacing the first key-value pair on every branch - IF
+        // we know we have to keep going.
+        if first {
+            self.replace_branch_first(old_key, new_key)?;
+        }
 
-        self.branches.push(b);
+        self.branches.push(branch);
+        Ok(())
+    }
+
+    /// Check if we can push down the root of the tree by one level or not.
+    fn reduce_depth(&mut self) -> Result<(), Error> {
+        self.branches.truncate(1);
+
+        // Extract our root page
+        let (mut page, _) = if self.leaf.is_some() {
+            return Ok(());
+        } else if let Some(b) = self.branches.pop() {
+            b
+        } else {
+            match WritePage::<B, L>::try_load(self.writer, self.root)?.0 {
+                WritePage::Branch(b) => (b, self.root),
+                _ => return Ok(()),
+            }
+        };
+
+        let mut iter = page.iter_mut();
+        let (_, first) = iter
+            .next()
+            .ok_or(Error::DataCorruption("branch should never be empty"))??;
+        let first = *first;
+
+        // If it's not the only value present, we're done.
+        if iter.next().is_some() {
+            return Ok(());
+        }
+
+        // Only page left? Time to pull that page up into the current page instead.
+        let (sub_page, _) = WritePage::<B, L>::try_load(self.writer, first)?;
+        match sub_page {
+            WritePage::Branch(b) => {
+                let root = b.as_const().copy_to(page.to_page());
+                unsafe {
+                    self.writer.deallocate_page(first)?;
+                }
+                self.branches.push((root, self.root));
+            }
+            WritePage::Leaf(l) => {
+                let root = l.as_const().copy_to(page.to_page());
+                unsafe {
+                    self.writer.deallocate_page(first)?;
+                }
+                self.leaf = Some((root, self.root));
+            }
+        }
+
         Ok(())
     }
 
     /// Try to rebalance the pages around the given key. This should unwind the
     /// tree in the process.
-    fn balance(&mut self, key: &L::Key) -> Result<(), Error> {
+    fn balance(&mut self, key: &L::Key) -> Result<bool, Error> {
         // Balance from the next branch up. If we can't go up, we tried to
         // balance the root, which we can't do, so just stop.
         let Some(mut branch) = self.branches.pop() else {
-            return Ok(());
+            return Ok(true);
         };
 
         // Extract a pair of pages that are next to each other and can be balanced.
@@ -377,10 +439,10 @@ where
             }
         }
         let Some(v0) = v0 else {
-            return Ok(());
+            return Ok(true);
         };
         let Some(v1) = v1 else {
-            return Ok(());
+            return Ok(true);
         };
 
         // Load the pages, replacing the page addresses in the process if needed.
@@ -427,6 +489,7 @@ where
                         let higher_page_num = *e.get();
                         branch.0 = e.delete();
                         self.branch_insert(branch, (new_key, higher_page_num))?;
+                        Ok(false)
                     }
                     Balance::Merged(lower) => {
                         let freed_page = *v1.1;
@@ -435,7 +498,7 @@ where
                         let old_key = lower
                             .get_pair(v1.0)?
                             .ok_or(Error::DataCorruption(
-                                "Balanced branch is missing expected pair",
+                                "Merged branch is missing expected pair",
                             ))?
                             .0;
                         let page::Entry::Occupied(e) = branch.0.entry(old_key)? else {
@@ -450,7 +513,13 @@ where
                         }
 
                         // This may make this branch relevant for a balancing. Repeat the process
-                        self.balance(key)?;
+                        if branch.0.free_space() > (PAGE_4K * 3 / 4) {
+                            self.balance(key)
+                        }
+                        else {
+                            Ok(true)
+                        }
+        
                     }
                 }
             }
@@ -476,6 +545,7 @@ where
                         let higher_page_num = *e.get();
                         branch.0 = e.delete();
                         self.branch_insert(branch, (new_key, higher_page_num))?;
+                        Ok(false)
                     }
                     Balance::Merged(lower) => {
                         let freed_page = *v1.1;
@@ -484,7 +554,7 @@ where
                         let old_key = lower
                             .get_pair(v1.0)?
                             .ok_or(Error::DataCorruption(
-                                "Balanced branch is missing expected pair",
+                                "Merged branch is missing expected pair",
                             ))?
                             .0;
                         let page::Entry::Occupied(e) = branch.0.entry(old_key)? else {
@@ -497,17 +567,21 @@ where
                         }
 
                         // This may make this branch relevant for a balancing. Repeat the process
-                        self.balance(key)?;
+                        if branch.0.free_space() > (PAGE_4K * 3 / 4) {
+                            self.balance(key)
+                        }
+                        else {
+                            Ok(true)
+                        }
                     }
                 }
             }
             _ => {
-                return Err(Error::DataCorruption(
+                Err(Error::DataCorruption(
                     "Found a branch and a leaf page sharing the same hierarchy level in the tree",
                 ))
             }
         }
-        Ok(())
     }
 }
 
@@ -564,8 +638,12 @@ where
         }
 
         // Check if we have a page that's a good candidate for rebalancing.
+        #[allow(clippy::collapsible_if)]
         if page.free_space() > (PAGE_4K * 3 / 4) {
-            self.tree.balance(self.key)?;
+            if self.tree.balance(self.key)? {
+                // Balancing may have eliminated the top of the tree. Check that now.
+                self.tree.reduce_depth()?;
+            }
         }
         Ok(())
     }
