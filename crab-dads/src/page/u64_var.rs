@@ -74,7 +74,7 @@ impl PageLayoutVectored for LayoutU64Var {
         if len > MAX_VAR_SIZE {
             return Err(Error::WriteTooLarge);
         }
-        Ok((value.len() + 7) / 8)
+        Ok((len + 7) / 8)
     }
 
     unsafe fn write_value_vectored(&mut self, val: &[&Self::Value], dst: &mut [u8]) {

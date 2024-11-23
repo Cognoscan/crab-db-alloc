@@ -648,10 +648,10 @@ where
         Ok(())
     }
 
-    pub fn replace(mut self, new_value: &L::Value) -> Result<Self, Error> {
+    pub fn replace(mut self, new_value: &L::Value) -> Result<(), Error> {
         // Try and replace normally first
         match self.entry.replace(new_value) {
-            Ok(()) => return Ok(self),
+            Ok(()) => return Ok(()),
             Err(Error::OutofSpace(_)) => (),
             Err(e) => return Err(e),
         }
@@ -666,12 +666,17 @@ where
             ));
         };
         entry.replace(new_value)?;
-        Ok(Self {
-            tree: self.tree,
-            key: self.key,
-            entry,
-            entry_page_num: leaf.1,
-        })
+
+        let page = entry.to_page();
+        #[allow(clippy::collapsible_if)]
+        if page.free_space() > (PAGE_4K * 3 / 4) {
+            if self.tree.balance(self.key)? {
+                // Balancing may have eliminated the top of the tree. Check that now.
+                self.tree.reduce_depth()?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -681,10 +686,10 @@ where
     L: PageLayoutVectored + PageLayout<Key = B::Key>,
     W: RawWrite,
 {
-    pub fn replace_vectored(mut self, new_value: &[&L::Value]) -> Result<Self, Error> {
+    pub fn replace_vectored(mut self, new_value: &[&L::Value]) -> Result<(), Error> {
         // Try and replace normally first
         match self.entry.replace_vectored(new_value) {
-            Ok(()) => return Ok(self),
+            Ok(()) => return Ok(()),
             Err(Error::OutofSpace(_)) => (),
             Err(e) => return Err(e),
         }
@@ -699,12 +704,17 @@ where
             ));
         };
         entry.replace_vectored(new_value)?;
-        Ok(Self {
-            tree: self.tree,
-            key: self.key,
-            entry,
-            entry_page_num: leaf.1,
-        })
+
+        let page = entry.to_page();
+        #[allow(clippy::collapsible_if)]
+        if page.free_space() > (PAGE_4K * 3 / 4) {
+            if self.tree.balance(self.key)? {
+                // Balancing may have eliminated the top of the tree. Check that now.
+                self.tree.reduce_depth()?;
+            }
+        }
+
+        Ok(())
     }
 }
 

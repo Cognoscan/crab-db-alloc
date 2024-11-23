@@ -22,8 +22,11 @@ use crate::{
     ByteFormatter, Error, TwoArrayTrailer, PAGE_4K,
 };
 
+#[derive(Clone, Debug)]
 struct Cutpoint {
+    /// Number of bytes to take off the end of the lower byte region
     lower_len: usize,
+    /// Number of bytes to take off the end of the upper byte region
     upper_bytes: usize,
 }
 
@@ -169,23 +172,23 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
             let upper_len_bytes = lengths.upper_bytes::<T>();
             let split_upper_len_bytes = upper_len_bytes - cutpoint.upper_bytes;
             core::ptr::copy_nonoverlapping(
-                self.page.add(cutpoint.lower_len),
+                self.page.add(split_lower_len),
                 new_page.page,
-                split_lower_len,
+                cutpoint.lower_len,
             );
             core::ptr::copy_nonoverlapping(
                 self.page.add(CONTENT_SIZE - upper_len_bytes),
-                new_page.page.add(CONTENT_SIZE - split_upper_len_bytes),
-                split_upper_len_bytes,
+                new_page.page.add(CONTENT_SIZE - cutpoint.upper_bytes),
+                cutpoint.upper_bytes,
             );
 
             // Update both trailers
             let trailer = self.page_trailer_mut();
-            trailer.set_lower_len(cutpoint.lower_len as u16);
-            trailer.set_upper_len((cutpoint.upper_bytes / core::mem::size_of::<T>()) as u16);
+            trailer.set_lower_len(split_lower_len as u16);
+            trailer.set_upper_len((split_upper_len_bytes / core::mem::size_of::<T>()) as u16);
             let new_trailer = new_page.page_trailer_mut();
-            new_trailer.set_lower_len(split_lower_len as u16);
-            new_trailer.set_upper_len((split_upper_len_bytes / core::mem::size_of::<T>()) as u16);
+            new_trailer.set_lower_len(cutpoint.lower_len as u16);
+            new_trailer.set_upper_len((cutpoint.upper_bytes / core::mem::size_of::<T>()) as u16);
 
             debug_assert!(
                 self.as_const().verify().is_ok(),
