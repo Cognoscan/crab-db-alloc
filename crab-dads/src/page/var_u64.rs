@@ -24,7 +24,7 @@ unsafe impl PageLayout for LayoutVarU64 {
     type Value = u64;
 
     fn key_len(&self) -> usize {
-        ((self.len + 7) / 8) as usize
+        self.len.div_ceil(8) as usize
     }
 
     fn value_len(&self) -> usize {
@@ -43,7 +43,7 @@ unsafe impl PageLayout for LayoutVarU64 {
         if key.len() > MAX_VAR_SIZE {
             return Err(Error::WriteTooLarge);
         }
-        Ok((key.len() + 7) / 8)
+        Ok(key.len().div_ceil(8))
     }
 
     fn determine_value_len(_: &Self::Value) -> Result<usize, Error> {

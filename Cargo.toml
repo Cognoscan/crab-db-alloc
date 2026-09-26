@@ -4,4 +4,5 @@ resolver = "2"
 members = [
     "crab-db",
     "crab-dads",
+    "crab-dads-traits",
 ]

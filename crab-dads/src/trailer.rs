@@ -27,26 +27,30 @@ impl core::fmt::Debug for TwoArrayTrailer {
 /// The lengths of the two arrays within a page.
 pub struct TwoArrayLengths {
     /// lower array length, in elements
-    pub lower: usize,
+    lower: usize,
     /// upper array length, in elements
-    pub upper: usize,
+    upper: usize,
 }
 
 impl TwoArrayLengths {
-    /// Get the total number of bytes, given the element type of the lower array
-    /// (`L`) and the upper array (`U`).
-    pub fn total<L, U>(&self) -> usize {
-        self.lower_bytes::<L>() + self.upper_bytes::<U>()
+    /// Get the number of elements in the upper array.
+    pub fn upper<U>(&self) -> usize {
+        self.upper / core::mem::size_of::<U>()
     }
 
-    /// Get the number of bytes in the lower array, given its element type (`L`).
-    pub fn lower_bytes<L>(&self) -> usize {
-        self.lower * core::mem::size_of::<L>()
+    /// Get the total number of bytes.
+    pub fn total(&self) -> usize {
+        self.lower + self.upper
     }
 
-    /// Get the number of bytes in the upper array, given its element type (`U`).
-    pub fn upper_bytes<U>(&self) -> usize {
-        self.upper * core::mem::size_of::<U>()
+    /// Get the number of bytes in the lower array.
+    pub fn lower_bytes(&self) -> usize {
+        self.lower
+    }
+
+    /// Get the number of bytes in the upper array.
+    pub fn upper_bytes(&self) -> usize {
+        self.upper
     }
 }
 
@@ -56,10 +60,28 @@ impl TwoArrayTrailer {
     /// constructed from these lengths in combination with a pointer to the base
     /// of the page.
     #[inline]
-    pub fn lengths<L, U>(&self, space: usize) -> Result<TwoArrayLengths, Error> {
+    pub fn lengths(&self, space: usize) -> Result<TwoArrayLengths, Error> {
         let ret = unsafe { self.lengths_unchecked() };
-        if ret.total::<L, U>() > space {
-            return Err(Error::DataCorruption("lengths are too large to fit within a page"));
+        if ret.total() > space {
+            return Err(Error::DataCorruption(
+                "lengths are too large to fit within a page",
+            ));
+        }
+        Ok(ret)
+    }
+
+    /// Extract the lengths of the fixed and variable portions, erroring if they
+    /// are out of range or are invalid. This also checks if the lengths are
+    /// valid for a given type layout. The check ensures that pointers can be
+    /// constructed from these lengths in combination with a pointer to the base
+    /// of the page.
+    #[inline]
+    pub fn lengths_layout<U>(&self, space: usize) -> Result<TwoArrayLengths, Error> {
+        let ret = self.lengths(space)?;
+        if ret.upper % core::mem::size_of::<U>() != 0 {
+            return Err(Error::DataCorruption(
+                "upper length is not a multiple of the layout type",
+            ));
         }
         Ok(ret)
     }

@@ -25,8 +25,8 @@ impl<'a, T: PageLayout> core::fmt::Debug for PageMap<'a, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let (lower, upper) = unsafe {
             let lengths = self.page_trailer().lengths_unchecked();
-            let upper_bytes = lengths.upper_bytes::<T>();
-            let lower = slice::from_raw_parts(self.page, lengths.lower_bytes::<u8>());
+            let upper_bytes = lengths.upper_bytes();
+            let lower = slice::from_raw_parts(self.page, lengths.lower_bytes());
             let upper = slice::from_raw_parts(self.page.add(CONTENT_SIZE-upper_bytes), upper_bytes);
             (lower, upper)
         };
@@ -46,7 +46,7 @@ impl<'a, T: PageLayout> PageMap<'a, T> {
             layout: PhantomData,
         };
         let trailer = ret.page_trailer();
-        trailer.lengths::<u8, T>(CONTENT_SIZE)?;
+        trailer.lengths_layout::<T>(CONTENT_SIZE)?;
         Ok(ret)
     }
 
@@ -59,10 +59,10 @@ impl<'a, T: PageLayout> PageMap<'a, T> {
     pub fn iter(&self) -> PageIter<'a, T> {
         unsafe {
             let lengths = self.page_trailer().lengths_unchecked();
-            let data = KeyValArray::new(slice::from_raw_parts(self.page, lengths.lower));
+            let data = KeyValArray::new(slice::from_raw_parts(self.page, lengths.lower_bytes()));
             let info = RevSizedArray::new(slice::from_raw_parts(
-                self.page.add(CONTENT_SIZE - lengths.upper_bytes::<T>()) as *const T,
-                lengths.upper,
+                self.page.add(CONTENT_SIZE - lengths.upper_bytes()) as *const T,
+                lengths.upper::<T>(),
             ));
             PageIter { info, data }
         }
@@ -92,10 +92,10 @@ impl<'a, T: PageLayout> PageMap<'a, T> {
         unsafe {
             // Copy the lower region
             let lengths = self.page_trailer().lengths_unchecked();
-            core::ptr::copy_nonoverlapping(self.page, dst.as_mut_ptr(), lengths.lower);
+            core::ptr::copy_nonoverlapping(self.page, dst.as_mut_ptr(), lengths.lower_bytes());
 
             // Copy the upper region, including the trailer data
-            let upper_bytes = lengths.upper_bytes::<T>() + core::mem::size_of::<TwoArrayTrailer>();
+            let upper_bytes = lengths.upper_bytes() + core::mem::size_of::<TwoArrayTrailer>();
             let upper_offset = PAGE_4K - upper_bytes;
             core::ptr::copy_nonoverlapping(
                 self.page.add(upper_offset),

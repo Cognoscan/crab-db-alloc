@@ -10,7 +10,7 @@ use crate::{
     Error,
 };
 
-use super::RawRead;
+use crab_dads_traits::RawRead;
 
 fn trim_leaf<'a, I, R, K, V, Q>(iter: &mut I, range: &R) -> Result<(), Error>
 where

@@ -3,24 +3,14 @@
 
 extern crate alloc;
 
+use crab_dads_traits::StorageError;
+
 pub mod arrays;
-mod trailer;
-pub use trailer::*;
 pub mod btree;
 pub mod page;
+mod trailer;
 
-#[derive(Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum StorageError {
-    /// I/O error in storage system.
-    Io(&'static str),
-    /// Database corruption detected.
-    Corruption(&'static str),
-    /// Rust memory safety violation detected.
-    Safety(&'static str),
-    /// Out of range request was made.
-    OutOfRange(u64),
-}
+pub use trailer::*;
 
 impl From<StorageError> for Error {
     fn from(value: StorageError) -> Self {
@@ -28,25 +18,8 @@ impl From<StorageError> for Error {
     }
 }
 
-impl core::fmt::Display for StorageError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Io(s) => write!(f, "I/O Error: {}", s),
-            Self::Corruption(s) => write!(f, "Database corruption: {}", s),
-            Self::Safety(s) => write!(f, "Safety violation: {}", s),
-            Self::OutOfRange(r) => write!(
-                f,
-                "Page outside of storage range was requested: Page 0x{:x}",
-                r
-            ),
-        }
-    }
-}
-
-impl core::error::Error for StorageError {}
-
 /// Error that can be returned while processing a data page
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
     /// Out of space; needed at least N bytes.

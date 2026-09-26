@@ -1,0 +1,18 @@
+[package]
+name = "crab-dads-traits"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+
+[features]
+default = ["std", "test-alloc"]
+# Include a basic allocator implementation for testing purposes
+test-alloc = ["std"]
+# Support std::io::Error as an encapsulated storage error type
+std = []
+
+[package.metadata.docs.rs]
+all-features = true

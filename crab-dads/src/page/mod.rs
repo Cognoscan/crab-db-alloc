@@ -1,3 +1,69 @@
+/*!
+Individual Page maps, used to construct a full B-Tree.
+
+# Layout
+
+A page is always 4kiB in size, containing two arrays and some page-level
+information in a trailer. The page-level information is in a 8-byte struct from
+offset 4088-4095, reproduced below. One array grows up from the bottom (eg.
+offset 0 towards offset 4087) and can have variable-length content. The other
+array grows from the top downwards (eg. offset 4087 down towards offset 0) and
+stores fixed-length content only. The lengths (in bytes) of these arrays are
+stored in the trailer.
+
+```Rust
+#[repr(C)]
+pub struct TwoArrayTrailer {
+    /// lower array length (grows up from start of the page)
+    lower_len: u16,
+    /// upper array length (grows down from end, minus this trailer)
+    upper_len: u16,
+    unused0: u16,
+    unused1: u8,
+    /// The page type identifier
+    pub page_type: u8,
+}
+```
+
+Bit 0 of page type identifier is used by B-Tree implementations to distinguish
+between branch nodes (bit is cleared) and leaf nodes (bit is set).
+
+The lower array is guaranteed to start out 4kiB-aligned, with individual alignment depd
+
+The actual content of the arrays is dependent on the [`PageLayout`], which must
+be determined from the page type byte in the trailer. The lower array is
+guaranteed to start out 4kiB-aligned, and any alignment of individual elements
+is determined by the page layout. The upper array is guaranteed to start out
+8-byte aligned, though alignment of individual elements may be less than this
+depending on page layout.
+
+The pre-defined layouts are:
+
+- [`LayoutU64U64`] - `u64` keys are stored in the upper array, `u64` values are
+  stored in the lower array.
+- [`LayoutU64Var`] - `u16` lengths are stored in the upper array, specifying the
+  length of the value. The lower array stores `u64` keys followed by
+  variable-byte-length values. While the value can be any byte length, it is
+  always stored in memory to be 8-byte-aligned, adding padding bytes to the
+  end as needed.
+- [`LayoutVarU64`] - `u16` lengths are stored in the upper array, specifying the
+  length of the key. The lower array stores variable-length keys followed by
+  `u64` values. While the key can be any byte length, it is always stored in
+  memory to be 8-byte-aligned, adding padding bytes to the end as needed.
+
+These layouts are sufficient to create 3 kinds of B-Trees:
+
+| Key    | Value  | Branch Layout    | Leaf Layout      |
+| --     | --     | --               | --               |
+| `u64`  | `u64`  | [`LayoutU64U64`] | [`LayoutU64U64`] |
+| `u64`  | `[u8]` | [`LayoutU64U64`] | [`LayoutU64Var`] |
+| `[u8]` | `u64`  | [`LayoutVarU64`] | [`LayoutVarU64`] |
+
+Other kinds are possible, but these are some of the most directly useful for
+building databases.
+
+ */
+
 mod page_map;
 mod traits;
 mod u64_u64;
@@ -44,6 +110,22 @@ pub fn page_type(page: &[u8; PAGE_4K]) -> u8 {
     trailer.page_type
 }
 
+pub fn copy_page(src: &[u8; PAGE_4K], dst: &mut [u8; PAGE_4K]) -> Result<(), Error> {
+
+    // Figure out how large the data is and calculate the upper offset
+    let trailer = unsafe { &*(src.as_ptr().byte_add(CONTENT_SIZE) as *const TwoArrayTrailer) };
+    let lengths = trailer.lengths(PAGE_4K)?;
+    let upper_len = lengths.upper_bytes() + core::mem::size_of::<TwoArrayTrailer>();
+    let upper_offset = PAGE_4K - upper_len;
+    
+    // Perform the two copies - lower_data and upper_data + trailer
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), lengths.lower_bytes());
+        core::ptr::copy_nonoverlapping(src.as_ptr().add(upper_offset), dst.as_mut_ptr().add(upper_offset), upper_len);
+    }
+    Ok(())
+}
+
 #[repr(transparent)]
 pub struct PageMapMut<'a, T: PageLayout> {
     layout: PhantomData<&'a mut T>,
@@ -54,8 +136,8 @@ impl<'a, T: PageLayout> core::fmt::Debug for PageMapMut<'a, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let (lower, upper) = unsafe {
             let lengths = self.page_trailer().lengths_unchecked();
-            let upper_bytes = lengths.upper_bytes::<T>();
-            let lower = slice::from_raw_parts(self.page, lengths.lower_bytes::<u8>());
+            let upper_bytes = lengths.upper_bytes();
+            let lower = slice::from_raw_parts(self.page, lengths.lower_bytes());
             let upper =
                 slice::from_raw_parts(self.page.add(CONTENT_SIZE - upper_bytes), upper_bytes);
             (lower, upper)
@@ -93,12 +175,12 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
             layout: PhantomData,
         };
         let trailer = ret.page_trailer();
-        trailer.lengths::<u8, T>(CONTENT_SIZE)?;
+        trailer.lengths_layout::<T>(CONTENT_SIZE)?;
         Ok(ret)
     }
 
     /// Borrow for immutable use
-    pub fn as_const(&self) -> &PageMap<T> {
+    pub fn as_const(&self) -> &PageMap<'_, T> {
         // These types have the same layout and point to data with the same layout.
         unsafe { &*(self as *const PageMapMut<T> as *const PageMap<T>) }
     }
@@ -107,8 +189,8 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
         unsafe {
             let lengths = self.as_const().page_trailer().lengths_unchecked();
             let info = slice::from_raw_parts(
-                self.page.add(CONTENT_SIZE - lengths.upper_bytes::<T>()) as *mut T,
-                lengths.upper,
+                self.page.add(CONTENT_SIZE - lengths.upper_bytes()) as *mut T,
+                lengths.upper::<T>(),
             );
             let mut info = crate::arrays::RevSizedArray::new(info);
 
@@ -124,7 +206,7 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                 let add_len = pair_len + core::mem::size_of::<T>();
                 if (add_len + move_amount) > target {
                     let mut new_upper_len_bytes =
-                        lengths.upper_bytes::<T>() - info.remaining_bytes();
+                        lengths.upper_bytes() - info.remaining_bytes();
                     // Determine if we actually take this final key-value pair or
                     // not. Choose whatever gets us closer to an even split.
                     if ((add_len + move_amount - target) > (target - move_amount))
@@ -136,7 +218,7 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                         // We do want to take it
                         taken_lower += pair_len;
                     }
-                    if taken_lower > lengths.lower {
+                    if taken_lower > lengths.lower_bytes() {
                         return Err(Error::DataCorruption("Page cutpoint took more bytes than are in the lower page region"));
                     }
                     return Ok(Cutpoint {
@@ -164,12 +246,12 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
             let mut new_page = PageMapMut::new(page, page_type);
 
             // Find the point at which we'll split the page
-            let total_len = lengths.total::<u8, T>();
+            let total_len = lengths.total();
             let cutpoint = self.find_cutpoint(total_len / 2, total_len)?;
 
             // Copy the data over
-            let split_lower_len = lengths.lower_bytes::<u8>() - cutpoint.lower_len;
-            let upper_len_bytes = lengths.upper_bytes::<T>();
+            let split_lower_len = lengths.lower_bytes() - cutpoint.lower_len;
+            let upper_len_bytes = lengths.upper_bytes();
             let split_upper_len_bytes = upper_len_bytes - cutpoint.upper_bytes;
             core::ptr::copy_nonoverlapping(
                 self.page.add(split_lower_len),
@@ -183,12 +265,14 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
             );
 
             // Update both trailers
+            debug_assert!(split_upper_len_bytes % core::mem::size_of::<T>() == 0, "Current page's upper length is not multiple of layout type");
+            debug_assert!(cutpoint.upper_bytes % core::mem::size_of::<T>() == 0, "New page's upper length is not multiple of layout type");
             let trailer = self.page_trailer_mut();
             trailer.set_lower_len(split_lower_len as u16);
-            trailer.set_upper_len((split_upper_len_bytes / core::mem::size_of::<T>()) as u16);
+            trailer.set_upper_len(split_upper_len_bytes as u16);
             let new_trailer = new_page.page_trailer_mut();
             new_trailer.set_lower_len(cutpoint.lower_len as u16);
-            new_trailer.set_upper_len((cutpoint.upper_bytes / core::mem::size_of::<T>()) as u16);
+            new_trailer.set_upper_len(cutpoint.upper_bytes as u16);
 
             debug_assert!(
                 self.as_const().verify().is_ok(),
@@ -239,22 +323,22 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                 let higher_len = higher.page_trailer().lengths_unchecked();
                 core::ptr::copy_nonoverlapping(
                     higher.page,
-                    self.page.add(self_len.lower_bytes::<u8>()),
-                    higher_len.lower_bytes::<u8>(),
+                    self.page.add(self_len.lower_bytes()),
+                    higher_len.lower_bytes(),
                 );
-                let upper_copy_len = higher_len.upper_bytes::<T>();
+                let upper_copy_len = higher_len.upper_bytes();
                 core::ptr::copy_nonoverlapping(
                     higher.page.add(CONTENT_SIZE - upper_copy_len),
                     self.page
-                        .add(CONTENT_SIZE - upper_copy_len - self_len.upper_bytes::<T>()),
+                        .add(CONTENT_SIZE - upper_copy_len - self_len.upper_bytes()),
                     upper_copy_len,
                 );
 
                 // Update the lengths
                 let trailer = self.page_trailer_mut();
-                trailer.add_to_lower_len(higher_len.lower as isize);
-                trailer.add_to_upper_len(higher_len.upper as isize);
-                debug_assert!(trailer.lengths::<u8,T>(CONTENT_SIZE).is_ok());
+                trailer.add_to_lower_len(higher_len.lower_bytes() as isize);
+                trailer.add_to_upper_len(higher_len.upper_bytes() as isize);
+                debug_assert!(trailer.lengths_layout::<T>(CONTENT_SIZE).is_ok());
 
                 // Verify after changing
                 debug_assert!(self.as_const().verify().is_ok(), "merged page should still be valid");
@@ -272,16 +356,16 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                 core::ptr::copy(
                     higher.page,
                     higher.page.add(cutpoint.lower_len),
-                    higher_len.lower,
+                    higher_len.lower_bytes(),
                 );
                 core::ptr::copy_nonoverlapping(
-                    self.page.add(self_len.lower - cutpoint.lower_len),
+                    self.page.add(self_len.lower_bytes() - cutpoint.lower_len),
                     higher.page,
                     cutpoint.lower_len,
                 );
 
                 // Make room and then copy the upper data
-                let higher_upper_bytes = higher_len.upper_bytes::<T>();
+                let higher_upper_bytes = higher_len.upper_bytes();
                 core::ptr::copy(
                     higher.page.add(CONTENT_SIZE - higher_upper_bytes),
                     higher
@@ -290,28 +374,27 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                     higher_upper_bytes,
                 );
                 core::ptr::copy_nonoverlapping(
-                    self.page.add(CONTENT_SIZE - self_len.upper_bytes::<T>()),
+                    self.page.add(CONTENT_SIZE - self_len.upper_bytes()),
                     higher
                         .page
                         .add(CONTENT_SIZE - cutpoint.upper_bytes),
                     cutpoint.upper_bytes,
                 );
 
-                // Calculate the changes to the lengths
                 let lower_delta = cutpoint.lower_len as isize;
-                let upper_delta = (cutpoint.upper_bytes / core::mem::size_of::<T>()) as isize;
+                let upper_delta = cutpoint.upper_bytes as isize;
 
                 // Update the lower page's lengths
                 let trailer = self.page_trailer_mut();
                 trailer.add_to_lower_len(-lower_delta);
                 trailer.add_to_upper_len(-upper_delta);
-                debug_assert!(trailer.lengths::<u8,T>(CONTENT_SIZE).is_ok());
+                debug_assert!(trailer.lengths_layout::<T>(CONTENT_SIZE).is_ok());
 
                 // Update the higher page's lengths
                 let trailer = higher.page_trailer_mut();
                 trailer.add_to_lower_len(lower_delta);
                 trailer.add_to_upper_len(upper_delta);
-                debug_assert!(trailer.lengths::<u8,T>(CONTENT_SIZE).is_ok());
+                debug_assert!(trailer.lengths_layout::<T>(CONTENT_SIZE).is_ok());
 
                 // Verify after changing
                 debug_assert!(self.as_const().verify().is_ok(), "balanced lower page should still be valid");
@@ -332,18 +415,18 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                 // Copy the lower data, then delete it from the higher page
                 core::ptr::copy_nonoverlapping(
                     higher.page,
-                    self.page.add(self_len.lower),
+                    self.page.add(self_len.lower_bytes()),
                     cutpoint.lower_len,
                 );
                 core::ptr::copy(
                     higher.page.add(cutpoint.lower_len),
                     higher.page,
-                    higher_len.lower - cutpoint.lower_len,
+                    higher_len.lower_bytes() - cutpoint.lower_len,
                 );
 
                 // Copy the upper data, then delete it from the higher page
-                let higher_upper_bytes = higher_len.upper_bytes::<T>();
-                let self_upper_bytes = self_len.upper_bytes::<T>();
+                let higher_upper_bytes = higher_len.upper_bytes();
+                let self_upper_bytes = self_len.upper_bytes();
                 core::ptr::copy_nonoverlapping(
                     higher.page.add(CONTENT_SIZE - cutpoint.upper_bytes),
                     self.page
@@ -358,21 +441,20 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
                     higher_upper_bytes - cutpoint.upper_bytes,
                 );
 
-                // Calculate the changes to the lengths
                 let lower_delta = cutpoint.lower_len as isize;
-                let upper_delta = (cutpoint.upper_bytes / core::mem::size_of::<T>()) as isize;
+                let upper_delta = cutpoint.upper_bytes as isize;
 
                 // Update this page's lengths
                 let trailer = self.page_trailer_mut();
                 trailer.add_to_lower_len(lower_delta);
                 trailer.add_to_upper_len(upper_delta);
-                debug_assert!(trailer.lengths::<u8,T>(CONTENT_SIZE).is_ok());
+                debug_assert!(trailer.lengths_layout::<T>(CONTENT_SIZE).is_ok());
 
                 // Update the higher page's lengths
                 let trailer = higher.page_trailer_mut();
                 trailer.add_to_lower_len(-lower_delta);
                 trailer.add_to_upper_len(-upper_delta);
-                debug_assert!(trailer.lengths::<u8,T>(CONTENT_SIZE).is_ok());
+                debug_assert!(trailer.lengths_layout::<T>(CONTENT_SIZE).is_ok());
 
                 // Verify after changing
                 debug_assert!(self.as_const().verify().is_ok(), "balanced lower page should still be valid");
@@ -409,23 +491,25 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
     /// Get how much free space is in the page.
     pub fn free_space(&self) -> usize {
         let lengths = unsafe { self.as_const().page_trailer().lengths_unchecked() };
-        CONTENT_SIZE - lengths.total::<u8, T>()
+        CONTENT_SIZE - lengths.total()
     }
 
     /// Get how many bytes of data are in the page.
     pub fn data_len(&self) -> usize {
         let lengths = unsafe { self.as_const().page_trailer().lengths_unchecked() };
-        lengths.total::<u8, T>()
+        lengths.total()
     }
 
     /// Iterate over the data within the map, with mutable access to the values.
     pub fn iter_mut(&mut self) -> PageIterMut<'_, T> {
         unsafe {
             let lengths = self.page_trailer().lengths_unchecked();
-            let data = KeyValArrayMut::new(slice::from_raw_parts_mut(self.page, lengths.lower));
+            dbg!(&lengths);
+            let data = KeyValArrayMut::new(slice::from_raw_parts_mut(self.page, lengths.lower_bytes()));
+            println!("page pointer = {:x}, length in bytes is {}, length is {}", self.page as u64, lengths.upper_bytes(), lengths.upper::<T>());
             let info = RevSizedArray::new(slice::from_raw_parts(
-                self.page.add(CONTENT_SIZE - lengths.upper_bytes::<T>()) as *const T,
-                lengths.upper,
+                self.page.add(CONTENT_SIZE - lengths.upper_bytes()) as *const T,
+                lengths.upper::<T>(),
             ));
             PageIterMut { info, data }
         }
@@ -444,11 +528,11 @@ impl<'a, T: PageLayout> PageMapMut<'a, T> {
             // Construct the two array iterators
             let mut kv = crate::arrays::KeyValArrayMutResize::new(slice::from_raw_parts_mut(
                 self.page,
-                lengths.lower,
+                lengths.lower_bytes(),
             ));
             let info = slice::from_raw_parts_mut(
-                self.page.add(CONTENT_SIZE - lengths.upper_bytes::<T>()) as *mut T,
-                lengths.upper,
+                self.page.add(CONTENT_SIZE - lengths.upper_bytes()) as *mut T,
+                lengths.upper::<T>(),
             );
             let mut info = crate::arrays::RevSizedArrayMutResize::new(info);
 
@@ -498,10 +582,10 @@ impl<'a, T: PageLayout> IntoIterator for PageMapMut<'a, T> {
     fn into_iter(self) -> PageIterMut<'a, T> {
         unsafe {
             let lengths = self.page_trailer().lengths_unchecked();
-            let data = KeyValArrayMut::new(slice::from_raw_parts_mut(self.page, lengths.lower));
+            let data = KeyValArrayMut::new(slice::from_raw_parts_mut(self.page, lengths.lower_bytes()));
             let info = RevSizedArray::new(slice::from_raw_parts(
-                self.page.add(CONTENT_SIZE - lengths.upper_bytes::<T>()) as *const T,
-                lengths.upper,
+                self.page.add(CONTENT_SIZE - lengths.upper_bytes()) as *const T,
+                lengths.upper::<T>(),
             ));
             PageIterMut { info, data }
         }
@@ -616,7 +700,7 @@ impl<'a, T: PageLayout> OccupiedEntry<'a, T> {
             self.info.back_delete();
             let delta = self.kv.delete();
             self.trailer.add_to_lower_len(-delta);
-            self.trailer.add_to_upper_len(-1);
+            self.trailer.add_to_upper_len(-(core::mem::size_of::<T>() as isize));
         }
 
         PageMapMut {
@@ -631,7 +715,7 @@ impl<'a, T: PageLayout> OccupiedEntry<'a, T> {
         let delta = (new_len as isize) - (self.kv.val().len() as isize);
         unsafe {
             // Check for the right size before resizing
-            let free = CONTENT_SIZE - self.trailer.lengths_unchecked().total::<u8, T>();
+            let free = CONTENT_SIZE - self.trailer.lengths_unchecked().total();
             if (free as isize) < delta {
                 return Err(Error::OutofSpace(delta as usize));
             }
@@ -664,7 +748,7 @@ where
         let delta = (new_len as isize) - (self.kv.val().len() as isize);
         unsafe {
             // Check for the right size before resizing
-            let free = CONTENT_SIZE - self.trailer.lengths_unchecked().total::<u8, T>();
+            let free = CONTENT_SIZE - self.trailer.lengths_unchecked().total();
             if (free as isize) < delta {
                 return Err(Error::OutofSpace(delta as usize));
             }
@@ -712,7 +796,7 @@ impl<'a, 'k, T: PageLayout> VacantEntry<'a, 'k, T> {
             Ok(len) => len,
             Err(e) => return Err((self, e)),
         };
-        let total_len = unsafe { self.trailer.lengths_unchecked().total::<u8, T>() };
+        let total_len = unsafe { self.trailer.lengths_unchecked().total() };
         let free = CONTENT_SIZE - total_len;
         let needed = key_len + val_len + core::mem::size_of::<T>();
         if needed > free {
@@ -723,7 +807,7 @@ impl<'a, 'k, T: PageLayout> VacantEntry<'a, 'k, T> {
             // Create the key-value allocation and initialize the info.
             self.kv.back_insert(key_len, val_len);
             self.trailer.add_to_lower_len((key_len + val_len) as isize);
-            self.trailer.add_to_upper_len(1);
+            self.trailer.add_to_upper_len(core::mem::size_of::<T>() as isize);
             self.info.back_insert(T::default());
 
             // Write out our key and value.
@@ -767,7 +851,7 @@ where
             Ok(len) => len,
             Err(e) => return Err((self, e)),
         };
-        let total_len = unsafe { self.trailer.lengths_unchecked().total::<u8, T>() };
+        let total_len = unsafe { self.trailer.lengths_unchecked().total() };
         let free = CONTENT_SIZE - total_len;
         let needed = key_len + val_len + core::mem::size_of::<T>();
         if needed < free {
@@ -778,7 +862,7 @@ where
             // Create the key-value allocation and initialize the info.
             self.kv.back_insert(key_len, val_len);
             self.trailer.add_to_lower_len((key_len + val_len) as isize);
-            self.trailer.add_to_upper_len(1);
+            self.trailer.add_to_upper_len(core::mem::size_of::<T>() as isize);
             self.info.back_insert(T::default());
 
             // Write out our key and value.

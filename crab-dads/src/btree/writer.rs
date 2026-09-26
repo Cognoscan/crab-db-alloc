@@ -1,11 +1,12 @@
 use alloc::vec::Vec;
+use crab_dads_traits::{LoadMutPage, RawWrite};
 
 use crate::{
     page::{self, Balance, PageLayout, PageLayoutVectored, PageMap, PageMapMut},
     Error, PAGE_4K,
 };
 
-use super::{reader::ReadPage, BTreeRead, LoadMutPage, RawWrite};
+use super::{reader::ReadPage, BTreeRead};
 
 pub struct BTreeWrite<'a, B, L, W>
 where
@@ -13,9 +14,13 @@ where
     L: PageLayout<Key = B::Key>,
     W: RawWrite,
 {
+    /// The Raw Writer we use to access memory.
     writer: &'a W,
+    /// Depth navigation through branches
     branches: Vec<(PageMapMut<'a, B>, u64)>,
+    /// None if we're currently in a branch, Some if we are on a leaf.
     leaf: Option<(PageMapMut<'a, L>, u64)>,
+    /// The index of the root page
     root: u64,
 }
 
@@ -33,23 +38,34 @@ where
     B: PageLayout<Value = u64>,
     L: PageLayout<Key = B::Key>,
 {
-    fn try_load<W: RawWrite>(writer: &'a W, page: u64) -> Result<(Self, Option<u64>), Error> {
+    /// Try and load a page from a `RawWrite` implementor. If the page was clean
+    /// and needed to be copied to enable writing to it, the new page number is returned.
+    pub fn try_load<W: RawWrite>(writer: &'a W, page: u64) -> Result<(Self, Option<u64>), Error> {
         unsafe {
-            match writer.load_mut_page(page)? {
+            Self::from_mut_page(writer, writer.load_mut_page(page)?, page)
+        }
+    }
+
+    /// Transform a loaded raw `LoadMutPage` into a `WritePage`.
+    /// 
+    /// If the loaded page is clean, it is copied over to the new allocation
+    /// provided in `LoadMutPage`, and the old page is deallocated. If this is
+    /// done, the returned `Option<u64>` contains the identifying number of the
+    /// new page.
+    pub fn from_mut_page<W: RawWrite>(writer: &'a W, page: LoadMutPage<'a>, read_page: u64) -> Result<(Self, Option<u64>), Error> {
+            match page {
                 LoadMutPage::Clean {
                     write,
                     write_page,
                     read,
                 } => {
-                    if (page::page_type(read) & 1) == 1 {
-                        let read: PageMap<'a, L> = PageMap::from_page(read)?;
-                        let write = read.copy_to(write);
-                        writer.deallocate_page(page)?;
+                    page::copy_page(read, write)?;
+                    unsafe { writer.deallocate_page(read_page)?; }
+                    if (page::page_type(write) & 1) == 1 {
+                        let write = PageMapMut::from_page(write)?;
                         Ok((WritePage::Leaf(write), Some(write_page)))
                     } else {
-                        let read: PageMap<'a, B> = PageMap::from_page(read)?;
-                        let write = read.copy_to(write);
-                        writer.deallocate_page(page)?;
+                        let write = PageMapMut::from_page(write)?;
                         Ok((WritePage::Branch(write), Some(write_page)))
                     }
                 }
@@ -61,7 +77,7 @@ where
                     }
                 }
             }
-        }
+
     }
 }
 
@@ -76,21 +92,24 @@ where
     /// # Safety
     ///
     /// The provided page (and any child pages it may later navigate to) must
-    /// all not be used mutably elsewhere in the program.
-    pub unsafe fn load(writer: &'a W, page: u64) -> Result<(Self, Option<u64>), Error> {
-        let (root, new_page) = WritePage::<B, L>::try_load(writer, page)?;
-        let root_page_num = new_page.unwrap_or(page);
+    /// all not be used mutably elsewhere.
+    pub unsafe fn load(
+        writer: &'a W,
+        page_num: u64,
+    ) -> Result<(Self, Option<u64>), Error> {
+        let (root, new_num) = WritePage::try_load(writer, page_num)?;
+        let page_num = new_num.unwrap_or(page_num);
         let mut s = Self {
             writer,
             branches: Vec::new(),
             leaf: None,
-            root: root_page_num,
+            root: page_num,
         };
         match root {
-            WritePage::Branch(b) => s.branches.push((b, root_page_num)),
-            WritePage::Leaf(l) => s.leaf = Some((l, root_page_num)),
+            WritePage::Branch(b) => s.branches.push((b, page_num)),
+            WritePage::Leaf(l) => s.leaf = Some((l, page_num)),
         };
-        Ok((s, new_page))
+        Ok((s, new_num))
     }
 
     /// Turn into a temporary reader
@@ -515,11 +534,9 @@ where
                         // This may make this branch relevant for a balancing. Repeat the process
                         if branch.0.free_space() > (PAGE_4K * 3 / 4) {
                             self.balance(key)
-                        }
-                        else {
+                        } else {
                             Ok(true)
                         }
-        
                     }
                 }
             }
@@ -569,18 +586,15 @@ where
                         // This may make this branch relevant for a balancing. Repeat the process
                         if branch.0.free_space() > (PAGE_4K * 3 / 4) {
                             self.balance(key)
-                        }
-                        else {
+                        } else {
                             Ok(true)
                         }
                     }
                 }
             }
-            _ => {
-                Err(Error::DataCorruption(
-                    "Found a branch and a leaf page sharing the same hierarchy level in the tree",
-                ))
-            }
+            _ => Err(Error::DataCorruption(
+                "Found a branch and a leaf page sharing the same hierarchy level in the tree",
+            )),
         }
     }
 }
