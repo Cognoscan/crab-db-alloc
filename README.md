@@ -1,23 +1,26 @@
 # crab-db, a memory-mapped key-value database
 
 This is another memory-mapped key-value database, in the same vein as 
-[LMDB](https://www.symas.com/lmdb). The supported tree types are:
+[LMDB](https://www.symas.com/lmdb). The default supported tree types are:
 
-- `U64Set: u64 -> ()`
 - `U64U64: u64 -> u64`
 - `U64Tree: u64 -> subtree`
 - `U64Bytes: u64 -> Vec<u8>`
-- `BytesSet: Vec<u8> -> ()`
 - `BytesU64: Vec<u8> -> u64`
 - `BytesTree: Vec<u8> -> subtree`
+
+Variable-length keys can be up to 1008 bytes long, and variable-length values 
+can be up to 2 MiB long. All values and keys are guaranteed to be contiguous in 
+memory.
 
 ## Features
 
 - ACID key-value database
-- Memory-mapped for efficient RAM usage
-- Small codebase
-- Nestable databases
+- Single-writer, many-reader, single-committer
 - Parallel writing for large values
+- Committer provides durability to storage separately from the writer
+- Memory-mapped and page-cache friendly for efficient RAM usage
+- Nestable databases
 - Clean-sheet design in Rust
 
 ## What does it NOT do?
@@ -56,6 +59,9 @@ usage.
 If you're using crab-db in low-resource contexts, like a phone, this can be
 quite helpful, as it runs no risk of blowing out RAM utilization.
 
+The database also plays well with filesystems supporting sparse files - backing 
+storage is allocated and freed in 2 MiB chunks.
+
 ## Small Codebase
 
 There are many complex databases, with enormous codebases supporting incredible
@@ -68,11 +74,10 @@ for a database that builds on top of crab-db.
 
 Many key-value databases provide only a single global key-value store, or an
 "environment" containing multiple key-value stores. crab-db goes a step
-further and allows for arbitrary nesting of key-value stores, meaning a "value"
-can be either a byte vector, or an entire sub-database.
+further and allows for arbitrary nesting of key-value stores.
 
 Sub-databases mean that key "prefixes" can be split up, effectively supporting
-things that would look like:
+maps that would look like:
 
 ```Rust
 BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, BTreeMap<Vec<u8>>>
@@ -80,5 +85,5 @@ BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, BTreeMap<Vec<u8>>>
 
 This may or may not be useful, depending on how many keys are under each prefix 
 on average. crab-db always separates out sub-databases from their parent 
-database, so small numbers of keys-value pairs in a sub-database (eg. under 4kiB 
+database, so small numbers of key-value pairs in a sub-database (eg. under 4kiB 
 of data) can be a waste of space.
