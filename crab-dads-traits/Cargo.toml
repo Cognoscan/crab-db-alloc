@@ -2,7 +2,7 @@
 name = "crab-dads-traits"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.81"
+rust-version = "1.93"
 
 [dependencies]
 bytemuck = { version = "1", features = ["derive"] }

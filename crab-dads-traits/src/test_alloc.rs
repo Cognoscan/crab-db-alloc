@@ -12,17 +12,18 @@ use super::*;
 
 #[derive(Clone)]
 struct BasicDbInner {
-    root: u64,
     memory: BTreeMap<u64, Box<[u8]>>,
-    checkouts: Vec<(u64, u64)>,
+    checkouts: BTreeMap<u64, u64>,
     commit: u64,
+    root_data: Vec<u64>,
+    used_pages: u64,
 }
 
-struct CheckoutFmt<'a>(&'a [(u64, u64)]);
+struct CheckoutFmt<'a>(&'a BTreeMap<u64, u64>);
 impl<'a> std::fmt::Debug for CheckoutFmt<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("[ ")?;
-        for (commit, count) in self.0 {
+        for (commit, count) in self.0.iter() {
             write!(f, "{}:{}, ", commit, count)?;
         }
         f.write_str("]")
@@ -54,161 +55,177 @@ impl<'a> std::fmt::Debug for MemoryFmt<'a> {
 impl std::fmt::Debug for BasicDbInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BasicDbInner")
-            .field("root", &self.root)
+            .field("root_data", &self.root_data)
             .field("commit", &self.commit)
-            .field("checkouts", &CheckoutFmt(self.checkouts.as_slice()))
+            .field("checkouts", &CheckoutFmt(&self.checkouts))
             .field("memory", &MemoryFmt(&self.memory))
             .finish()
     }
 }
 
 /// A simple database reader unit.
-///
-/// Reads are synchronized with the writer whenever [`reload`][Self::reload] is
-/// called.
-pub struct BasicDbRead {
+#[derive(Clone)]
+pub struct BasicDbReader {
     inner: Arc<RwLock<BasicDbInner>>,
-    root: u64,
-    commit: u64,
 }
 
-impl Clone for BasicDbRead {
-    fn clone(&self) -> Self {
+impl<'a> StorageReader for &'a BasicDbReader {
+    type R = BasicDbRead<'a>;
+
+    fn read(self) -> Self::R {
         let mut inner = self.inner.write().unwrap();
 
         let commit = inner.commit;
-        let co = inner.checkouts.iter_mut().rev().find(|(c, _)| c == &commit);
-        if let Some(co) = co {
-            co.1 += 1;
-        } else {
-            inner.checkouts.push((commit, 1));
-        }
-        let root = inner.root;
-
-        Self {
-            inner: self.inner.clone(),
-            root,
+        *inner.checkouts.entry(commit).or_default() += 1;
+        let root_data = inner.root_data.clone();
+        BasicDbRead {
+            inner: self,
             commit,
+            root_data,
         }
     }
 }
 
-impl BasicDbRead {
-    /// Update this reader to pull in the latest commits from the writer.
-    pub fn reload(self) -> Self {
-        let new = self.clone();
-        drop(self);
-        new
-    }
+/// A simple database read transaction.
+pub struct BasicDbRead<'a> {
+    inner: &'a BasicDbReader,
+    commit: u64,
+    root_data: Vec<u64>,
+}
 
-    /// Get the root page of the database.
-    pub fn root(&self) -> u64 {
-        self.root
+impl<'a> Drop for BasicDbRead<'a> {
+    fn drop(&mut self) {
+        let Ok(mut inner) = self.inner.inner.write() else {
+            return;
+        };
+        let count = inner
+            .checkouts
+            .entry(self.commit)
+            .and_modify(|x| *x -= 1)
+            .or_default();
+        if *count == 0 {
+            inner.checkouts.remove(&self.commit);
+        }
     }
 }
 
-unsafe impl RawRead for BasicDbRead {
-    unsafe fn load(&self, page: u64, num_pages: usize) -> Result<&[u8], StorageError> {
-        let inner = self.inner.read().unwrap();
+unsafe impl<'a> ReadTxn for BasicDbRead<'a> {
+    unsafe fn load(&self, region: u64) -> Result<&Region, StorageError> {
+        let inner = self.inner.inner.read().unwrap();
         let mem = inner
             .memory
-            .get(&page)
-            .ok_or(StorageError::OutOfRange(page))?;
-        if mem.len() != (num_pages * PAGE_4K) {
-            return Err(StorageError::Corruption(
-                "Incorrect size for the requested page",
-            ));
-        }
-        // We pinky-promised that we won't drop this memory until this
+            .get(&region)
+            .ok_or(StorageError::OutOfRange(region))?;
+        // We won't drop this memory until this
         // reader's checkout advances (or it is dropped)
-        unsafe { Ok(core::slice::from_raw_parts(mem.as_ptr(), mem.len())) }
+        unsafe { Ok(Region::from_raw_parts(mem.as_ptr(), mem.len())) }
     }
-}
 
-impl Drop for BasicDbRead {
-    fn drop(&mut self) {
-        let mut inner = self.inner.write().unwrap();
+    fn root_data(&self) -> &[u64] {
+        &self.root_data
+    }
 
-        let old_co = inner
-            .checkouts
-            .iter_mut()
-            .position(|(c, _)| c == &self.commit)
-            .unwrap();
-        inner.checkouts[old_co].1 -= 1;
-        if inner.checkouts[old_co].1 == 0 {
-            inner.checkouts.remove(old_co);
-        }
+    fn elapsed(&self) -> u64 {
+        let write_commit = self.inner.inner.read().unwrap().commit;
+        write_commit - self.commit
     }
 }
 
 fn alloc_paged(pages: usize) -> Box<[u8]> {
+    let len = PAGE_4K * pages;
     unsafe {
-        let len = PAGE_4K * pages;
+        // Unsafe ops are to ensure the allocated memory is page-aligned.
         let ptr = std::alloc::alloc(core::alloc::Layout::from_size_align_unchecked(len, PAGE_4K));
         Box::from_raw(core::ptr::slice_from_raw_parts_mut(ptr, len))
     }
 }
 
 /// Construct a new memory-only, simplified database.
-pub fn new_db<F>(init: F) -> (BasicDbRead, BasicDbWrite)
-where
-    F: Fn(&mut [u8; PAGE_4K]),
-{
-    let mut memory = BTreeMap::new();
-    let mut mem = alloc_paged(1);
-    unsafe {
-        init(&mut *(mem.as_mut_ptr() as *mut [u8; 4096]));
-    }
-    memory.insert(0, mem);
+pub fn new_db() -> (BasicDbReader, BasicDbWriter) {
+    // Actual interior state of the database
+    let memory = BTreeMap::new();
+    let root_data = Vec::new();
 
+    // Construct the interior shared state.
     let inner = Arc::new(RwLock::new(BasicDbInner {
-        root: 0,
         memory,
-        checkouts: vec![(0, 1)],
+        checkouts: BTreeMap::new(),
+        root_data: root_data.clone(),
         commit: 0,
+        used_pages: 0,
     }));
-    let read = BasicDbRead {
+
+    let read = BasicDbReader {
         inner: inner.clone(),
-        root: 0,
-        commit: 0,
     };
 
-    let write = BasicDbWrite {
+    let write = BasicDbWriter {
         inner,
-        cell: RefCell::new(BasicDbWriteCell {
-            dirty: BTreeMap::new(),
-            to_drop: VecDeque::new(),
-            page_num: 1,
-            root: 0,
-        }),
-        commit: 0,
-        starting_page_num: 1,
-        starting_root: 0,
+        page_num: 0,
+        to_drop: VecDeque::new(),
     };
     (read, write)
 }
 
 /// A simple in-memory writer for a database.
 #[derive(Debug)]
-pub struct BasicDbWrite {
+pub struct BasicDbWriter {
     inner: Arc<RwLock<BasicDbInner>>,
+    page_num: u64,
+    to_drop: VecDeque<(u64, Vec<u64>)>,
+}
+
+impl<'a> StorageWriter for &'a mut BasicDbWriter {
+    type W = BasicDbWrite<'a>;
+    fn write(self) -> Self::W {
+        let root_data = self.inner.read().unwrap().root_data.clone();
+        let cell = RefCell::new(BasicDbWriteCell {
+            page_num: self.page_num,
+            dirty: BTreeMap::new(),
+            to_drop: Vec::new(),
+            new_pages: 0,
+        });
+        BasicDbWrite {
+            inner: self,
+            cell,
+            root_data,
+        }
+    }
+
+    fn stats(&self) -> StorageStats {
+        let inner = self.inner.read().unwrap();
+        let used_pages = inner.used_pages;
+        let writes = inner.commit;
+        drop(inner);
+        StorageStats {
+            total_pages: used_pages,
+            free_pages: 0,
+            uncommitted_pages: 0,
+            used_pages,
+            storage_pages: 0,
+            writes,
+            uncommitted_writes: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct BasicDbWrite<'a> {
+    inner: &'a mut BasicDbWriter,
     cell: RefCell<BasicDbWriteCell>,
-    commit: u64,
-    starting_page_num: u64,
-    starting_root: u64,
+    root_data: Vec<u64>,
 }
 
 struct BasicDbWriteCell {
     page_num: u64,
     dirty: BTreeMap<u64, Box<[u8]>>,
-    to_drop: VecDeque<(u64, Vec<u64>)>,
-    root: u64,
+    to_drop: Vec<u64>,
+    new_pages: u64,
 }
 
 impl std::fmt::Debug for BasicDbWriteCell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BasicDbWriteCell")
-            .field("root", &self.root)
             .field("page_num", &self.page_num)
             .field("dirty", &MemoryFmt(&self.dirty))
             .field("to_drop", &self.to_drop)
@@ -216,131 +233,109 @@ impl std::fmt::Debug for BasicDbWriteCell {
     }
 }
 
-impl BasicDbWrite {
-    /// Get how many pages are currently in the entire database.
-    pub fn page_count(&self) -> usize {
-        let mem_len = self.inner.read().unwrap().memory.len();
-        let dirty_len = self.cell.borrow().dirty.len();
-        mem_len + dirty_len
-    }
-
-    /// Commit all outstanding write operations to the database.
-    pub fn commit(&mut self) {
-        let mut inner = self.inner.write().unwrap();
-
-        // Move the dirty pages into the full tree map.
-        let dirty = &mut self.cell.get_mut().dirty;
-        while let Some(d) = dirty.pop_last() {
-            inner.memory.insert(d.0, d.1);
-        }
-
-        // Update the rest of our state.
-        self.starting_page_num = self.cell.get_mut().page_num;
-        self.starting_root = self.cell.get_mut().root;
-        self.commit += 1;
-        inner.root = self.cell.get_mut().root;
-        inner.commit += 1;
-
-        // Ditch any unused pages
-        let oldest_co = inner.checkouts.first().map(|(c, _)| *c).unwrap_or(u64::MAX);
-        while let Some(d) = self.cell.get_mut().to_drop.pop_front() {
-            if d.0 >= oldest_co {
-                self.cell.get_mut().to_drop.push_front(d);
-                break;
-            }
-            for d in d.1 {
-                inner.memory.remove(&d);
-            }
-        }
-    }
-
-    /// Reset and forget all outstanding writes to the database.
-    pub fn reset(&mut self) {
-        let cell = self.cell.get_mut();
-        if let Some((co, _)) = cell.to_drop.back() {
-            if *co == (self.commit + 1) {
-                cell.to_drop.pop_back();
-            }
-        }
-        cell.dirty.clear();
-        cell.page_num = self.starting_page_num;
-        cell.root = self.starting_root;
-    }
-
-    pub fn root(&self) -> u64 {
-        self.cell.borrow().root
-    }
-
-    pub fn update_root(&self, root: u64) {
-        self.cell.borrow_mut().root = root;
-    }
-}
-
-unsafe impl RawRead for BasicDbWrite {
-    unsafe fn load(&self, page: u64, num_pages: usize) -> Result<&[u8], StorageError> {
-        let inner = self.inner.read().unwrap();
+unsafe impl<'a> ReadTxn for BasicDbWrite<'a> {
+    unsafe fn load(&self, region: u64) -> Result<&Region, StorageError> {
+        let inner = self.inner.inner.read().unwrap();
         let cell: &BasicDbWriteCell = &self.cell.borrow();
         let mem = inner
             .memory
-            .get(&page)
-            .or_else(|| cell.dirty.get(&page))
-            .ok_or(StorageError::OutOfRange(page))?;
-        if mem.len() != (num_pages * PAGE_4K) {
-            return Err(StorageError::Corruption(
-                "Incorrect size for the requested page",
-            ));
-        }
+            .get(&region)
+            .or_else(|| cell.dirty.get(&region))
+            .ok_or(StorageError::OutOfRange(region))?;
         // We pinky-promised that we won't drop this memory until this
         // reader's checkout advances (or it is dropped)
-        unsafe { Ok(core::slice::from_raw_parts(mem.as_ptr(), mem.len())) }
+        unsafe { Ok(Region::from_raw_parts(mem.as_ptr(), mem.len())) }
+    }
+
+    fn root_data(&self) -> &[u64] {
+        &self.root_data
+    }
+
+    fn elapsed(&self) -> u64 {
+        0
     }
 }
 
-unsafe impl RawWrite for BasicDbWrite {
-    fn allocate(&self, num_pages: usize) -> Result<(&mut [u8], u64), StorageError> {
-        unsafe {
-            let page_num = self.cell.borrow().page_num;
-            self.cell.borrow_mut().page_num += 1;
+unsafe impl<'a> WriteTxn for BasicDbWrite<'a> {
 
+    fn added_pages(&self) -> u64 {
+        self.cell.borrow().new_pages        
+    }
+
+    fn allocate(&self, num_pages: usize) -> Result<(&mut Region, u64), StorageError> {
+        assert!(num_pages > 0);
+        unsafe {
+            // Allocate the memory
             let mut mem = alloc_paged(num_pages);
-            let raw = core::slice::from_raw_parts_mut(mem.as_mut_ptr(), mem.len());
-            self.cell.borrow_mut().dirty.insert(page_num, mem);
-            Ok((raw, page_num))
+            let raw = Region::from_raw_parts_mut(mem.as_mut_ptr(), mem.len());
+            // Update the inner write transaction
+            let mut cell = self.cell.borrow_mut();
+            let region = cell.page_num;
+            cell.page_num += 1;
+            cell.dirty.insert(region, mem);
+            cell.new_pages += num_pages as u64;
+            Ok((raw, region))
         }
     }
 
-    unsafe fn deallocate(&self, page: u64, _num_pages: usize) -> Result<(), StorageError> {
-        if (self.cell.borrow_mut().dirty.remove(&page)).is_some() {
+    unsafe fn deallocate(&self, region: u64) -> Result<(), StorageError> {
+        if (self.cell.borrow_mut().dirty.remove(&region)).is_some() {
             return Ok(());
         }
-        let to_drop = &mut self.cell.borrow_mut().to_drop;
-        if let Some(td) = to_drop.back_mut() {
-            if td.0 == (self.commit + 1) {
-                td.1.push(page);
-            } else {
-                to_drop.push_back((self.commit + 1, vec![page]));
-            }
-        } else {
-            to_drop.push_back((self.commit + 1, vec![page]));
-        }
+        self.cell.borrow_mut().to_drop.push(region);
         Ok(())
     }
 
-    unsafe fn load_mut(&self, page: u64, num_pages: usize) -> Result<LoadMut<'_>, StorageError> {
+    unsafe fn load_mut(&self, region: u64) -> Result<LoadMut<'_>, StorageError> {
         unsafe {
-            if let Some(p) = self.cell.borrow_mut().dirty.get_mut(&page) {
-                return Ok(LoadMut::Dirty(core::slice::from_raw_parts_mut(
+            if let Some(p) = self.cell.borrow_mut().dirty.get_mut(&region) {
+                return Ok(LoadMut::Dirty(Region::from_raw_parts_mut(
                     p.as_mut_ptr(),
                     p.len(),
                 )));
             }
-            let read = self.load(page, num_pages)?;
-            let (write, write_page) = self.allocate(num_pages)?;
+            let read = self.load(region)?;
+            let (write, write_page) = self.allocate(read.num_pages())?;
             Ok(LoadMut::Clean {
                 write,
                 write_page,
                 read,
             })
         }
+    }
+
+    /// Commit all outstanding write operations to the database.
+    fn commit(self, data: &[u64]) -> Result<(), StorageError> {
+        // Decompose our transaction into its inner content
+        let writer = self.inner;
+        let mut db = writer.inner.write().unwrap();
+        let write = self.cell.into_inner();
+
+        // Move the dirty pages into the full tree map.
+        for (page, data) in write.dirty.into_iter() {
+            db.memory.insert(page, data);
+        }
+
+        // Update the root info of the database
+        db.commit += 1;
+        db.root_data.clear();
+        db.root_data.copy_from_slice(data);
+
+        // See if we can work through any of the "to_free" lists
+        let oldest_checkout = db.checkouts.keys().next().copied().unwrap_or(u64::MAX);
+        while let Some(drop_list) = writer
+            .to_drop
+            .pop_front_if(|(commit, _)| oldest_checkout > *commit)
+        {
+            let list = drop_list.1;
+            for page in list {
+                let _ = db.memory.remove(&page);
+            }
+        }
+
+        // Update the writer-only content
+        writer.to_drop.push_back((db.commit, write.to_drop));
+        writer.page_num = write.page_num;
+        Ok(())
     }
 }
