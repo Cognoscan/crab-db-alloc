@@ -315,6 +315,7 @@ impl<'a> KeyValArrayMutResize<'a> {
     ///
     /// If increasing in size, the backing memory must have sufficient space.
     pub unsafe fn resize(&mut self, delta: isize) {
+        if delta == 0 { return; }
         unsafe {
             // Calculate the new location for the neighboring key
             let new_prev_back_key = self.prev_back_key.offset(delta);

@@ -97,8 +97,8 @@ impl TwoArrayTrailer {
     /// anything with the result of this function.
     pub unsafe fn lengths_unchecked(&self) -> TwoArrayLengths {
         TwoArrayLengths {
-            upper: self.upper_len as usize,
-            lower: self.lower_len as usize,
+            upper: self.upper_len.to_le() as usize,
+            lower: self.lower_len.to_le() as usize,
         }
     }
 
@@ -106,7 +106,7 @@ impl TwoArrayTrailer {
     #[inline]
     pub fn set_upper_len(&mut self, len: u16) {
         debug_assert!(len <= 4088);
-        self.upper_len = len;
+        self.upper_len = len.to_le();
     }
 
     /// Add to the upper length.
@@ -116,16 +116,16 @@ impl TwoArrayTrailer {
     /// The delta must not cause the length to over/underflow a `u16` value.
     #[inline]
     pub unsafe fn add_to_upper_len(&mut self, delta: isize) {
-        let len = self.upper_len as isize + delta;
+        let len = self.upper_len.to_le() as isize + delta;
         debug_assert!(len <= 4088);
-        self.upper_len = len as u16;
+        self.upper_len = (len as u16).to_le();
     }
 
     /// Set the lower length
     #[inline]
     pub fn set_lower_len(&mut self, len: u16) {
         debug_assert!(len <= 4088);
-        self.lower_len = len;
+        self.lower_len = len.to_le();
     }
 
     /// Add to the lower length.
@@ -135,8 +135,8 @@ impl TwoArrayTrailer {
     /// The delta must not cause the length to over/underflow a `u16` value.
     #[inline]
     pub unsafe fn add_to_lower_len(&mut self, delta: isize) {
-        let len = self.lower_len as isize + delta;
+        let len = self.lower_len.to_le() as isize + delta;
         debug_assert!(len <= 4088);
-        self.lower_len = len as u16;
+        self.lower_len = (len as u16).to_le();
     }
 }

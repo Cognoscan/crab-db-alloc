@@ -1,9 +1,9 @@
 use alloc::vec::Vec;
-use crab_dads_traits::{LoadMutPage, RawWrite};
+use crab_dads_traits::{LoadMut, WriteTxn};
 
 use crate::{
     page::{self, Balance, PageLayout, PageLayoutVectored, PageMap, PageMapMut},
-    Error, PAGE_4K,
+    Error,
 };
 
 use super::{reader::ReadPage, BTreeRead};
@@ -12,7 +12,7 @@ pub struct BTreeWrite<'a, B, L, W>
 where
     B: PageLayout<Value = u64>,
     L: PageLayout<Key = B::Key>,
-    W: RawWrite,
+    W: WriteTxn,
 {
     /// The Raw Writer we use to access memory.
     writer: &'a W,
@@ -38,46 +38,49 @@ where
     B: PageLayout<Value = u64>,
     L: PageLayout<Key = B::Key>,
 {
-    /// Try and load a page from a `RawWrite` implementor. If the page was clean
+    /// Try and load a page from a `WriteTxn` implementor. If the page was clean
     /// and needed to be copied to enable writing to it, the new page number is returned.
-    pub fn try_load<W: RawWrite>(writer: &'a W, page: u64) -> Result<(Self, Option<u64>), Error> {
-        unsafe {
-            Self::from_mut_page(writer, writer.load_mut_page(page)?, page)
-        }
+    pub fn try_load<W: WriteTxn>(writer: &'a W, page: u64) -> Result<(Self, Option<u64>), Error> {
+        unsafe { Self::from_mut_page(writer, writer.load_mut(page)?, page) }
     }
 
     /// Transform a loaded raw `LoadMutPage` into a `WritePage`.
-    /// 
+    ///
     /// If the loaded page is clean, it is copied over to the new allocation
     /// provided in `LoadMutPage`, and the old page is deallocated. If this is
     /// done, the returned `Option<u64>` contains the identifying number of the
     /// new page.
-    pub fn from_mut_page<W: RawWrite>(writer: &'a W, page: LoadMutPage<'a>, read_page: u64) -> Result<(Self, Option<u64>), Error> {
-            match page {
-                LoadMutPage::Clean {
-                    write,
-                    write_page,
-                    read,
-                } => {
-                    page::copy_page(read, write)?;
-                    unsafe { writer.deallocate_page(read_page)?; }
-                    if (page::page_type(write) & 1) == 1 {
-                        let write = PageMapMut::from_page(write)?;
-                        Ok((WritePage::Leaf(write), Some(write_page)))
-                    } else {
-                        let write = PageMapMut::from_page(write)?;
-                        Ok((WritePage::Branch(write), Some(write_page)))
-                    }
+    pub fn from_mut_page<W: WriteTxn>(
+        writer: &'a W,
+        page: LoadMut<'a>,
+        read_page: u64,
+    ) -> Result<(Self, Option<u64>), Error> {
+        match page {
+            LoadMut::Clean {
+                write,
+                write_page,
+                read,
+            } => {
+                page::copy_page(read, write)?;
+                unsafe {
+                    writer.deallocate(read_page)?;
                 }
-                LoadMutPage::Dirty(d) => {
-                    if (page::page_type(d) & 1) == 1 {
-                        Ok((WritePage::Leaf(PageMapMut::from_page(d)?), None))
-                    } else {
-                        Ok((WritePage::Branch(PageMapMut::from_page(d)?), None))
-                    }
+                if (page::page_type(write) & 1) == 1 {
+                    let write = PageMapMut::from_page(write)?;
+                    Ok((WritePage::Leaf(write), Some(write_page)))
+                } else {
+                    let write = PageMapMut::from_page(write)?;
+                    Ok((WritePage::Branch(write), Some(write_page)))
                 }
             }
-
+            LoadMut::Dirty(d) => {
+                if (page::page_type(d) & 1) == 1 {
+                    Ok((WritePage::Leaf(PageMapMut::from_page(d)?), None))
+                } else {
+                    Ok((WritePage::Branch(PageMapMut::from_page(d)?), None))
+                }
+            }
+        }
     }
 }
 
@@ -85,7 +88,7 @@ impl<'a, B, L, W> BTreeWrite<'a, B, L, W>
 where
     B: PageLayout<Value = u64>,
     L: PageLayout<Key = B::Key>,
-    W: RawWrite,
+    W: WriteTxn,
 {
     /// Load in the root page of a tree.
     ///
@@ -93,10 +96,7 @@ where
     ///
     /// The provided page (and any child pages it may later navigate to) must
     /// all not be used mutably elsewhere.
-    pub unsafe fn load(
-        writer: &'a W,
-        page_num: u64,
-    ) -> Result<(Self, Option<u64>), Error> {
+    pub unsafe fn load(writer: &'a W, page_num: u64) -> Result<(Self, Option<u64>), Error> {
         let (root, new_num) = WritePage::try_load(writer, page_num)?;
         let page_num = new_num.unwrap_or(page_num);
         let mut s = Self {
@@ -225,8 +225,8 @@ where
 
         // Branch is out of space, time to split it up
 
-        let new_branch = self.writer.allocate_page()?;
         let mut old_branch = (vacant.to_page(), branch.1);
+        let new_branch = self.writer.allocate(old_branch.0.num_4k_pages())?;
         let new_branch = (old_branch.0.split_to(new_branch.0)?, new_branch.1);
         let (k2, _) = new_branch
             .0
@@ -241,9 +241,9 @@ where
                 // Root page. To keep the root page at the same page
                 // number, we've got to copy it over to a new page, then
                 // put both that new page and the higher page in.
-                let copy_branch = self.writer.allocate_page()?;
+                let copy_branch = self.writer.allocate(old_branch.0.num_4k_pages())?;
                 let copy_branch = (
-                    old_branch.0.as_const().copy_to(copy_branch.0),
+                    old_branch.0.as_const().copy_to(copy_branch.0)?,
                     copy_branch.1,
                 );
                 let page_type = old_branch.0.page_trailer().page_type;
@@ -304,7 +304,7 @@ where
         key: &L::Key,
     ) -> Result<(PageMapMut<'a, L>, u64), Error> {
         // We need to split the page
-        let new_leaf = self.writer.allocate_page()?;
+        let new_leaf = self.writer.allocate(leaf.0.num_4k_pages())?;
         let new_leaf = (leaf.0.split_to(new_leaf.0)?, new_leaf.1);
         let (k2, _) = new_leaf
             .0
@@ -318,8 +318,8 @@ where
                 // Root page. To keep the root page at the same page
                 // number, we've got to copy it over to a new page, then
                 // put both that new page and the higher page in.
-                let copy_leaf = self.writer.allocate_page()?;
-                let copy_leaf = (leaf.0.as_const().copy_to(copy_leaf.0), copy_leaf.1);
+                let copy_leaf = self.writer.allocate(leaf.0.num_4k_pages())?;
+                let copy_leaf = (leaf.0.as_const().copy_to(copy_leaf.0)?, copy_leaf.1);
                 let page_type = leaf.0.page_trailer().page_type & 0xFE;
 
                 // Create the branch
@@ -419,16 +419,16 @@ where
         let (sub_page, _) = WritePage::<B, L>::try_load(self.writer, first)?;
         match sub_page {
             WritePage::Branch(b) => {
-                let root = b.as_const().copy_to(page.to_page());
+                let root = b.as_const().copy_to(page.to_page())?;
                 unsafe {
-                    self.writer.deallocate_page(first)?;
+                    self.writer.deallocate(first)?;
                 }
                 self.branches.push((root, self.root));
             }
             WritePage::Leaf(l) => {
-                let root = l.as_const().copy_to(page.to_page());
+                let root = l.as_const().copy_to(page.to_page())?;
                 unsafe {
-                    self.writer.deallocate_page(first)?;
+                    self.writer.deallocate(first)?;
                 }
                 self.leaf = Some((root, self.root));
             }
@@ -528,11 +528,11 @@ where
 
                         branch.0 = e.delete();
                         unsafe {
-                            self.writer.deallocate_page(freed_page)?;
+                            self.writer.deallocate(freed_page)?;
                         }
 
                         // This may make this branch relevant for a balancing. Repeat the process
-                        if branch.0.free_space() > (PAGE_4K * 3 / 4) {
+                        if branch.0.should_balance() {
                             self.balance(key)
                         } else {
                             Ok(true)
@@ -580,11 +580,11 @@ where
 
                         branch.0 = e.delete();
                         unsafe {
-                            self.writer.deallocate_page(freed_page)?;
+                            self.writer.deallocate(freed_page)?;
                         }
 
                         // This may make this branch relevant for a balancing. Repeat the process
-                        if branch.0.free_space() > (PAGE_4K * 3 / 4) {
+                        if branch.0.should_balance() {
                             self.balance(key)
                         } else {
                             Ok(true)
@@ -603,7 +603,7 @@ pub enum Entry<'a, 't, 'k, B, L, W>
 where
     B: PageLayout<Value = u64>,
     L: PageLayout<Key = B::Key>,
-    W: RawWrite,
+    W: WriteTxn,
 {
     Occupied(OccupiedEntry<'a, 't, 'k, B, L, W>),
     Vacant(VacantEntry<'a, 't, 'k, B, L, W>),
@@ -613,7 +613,7 @@ pub struct OccupiedEntry<'a, 't, 'k, B, L, W>
 where
     B: PageLayout<Value = u64>,
     L: PageLayout<Key = B::Key>,
-    W: RawWrite,
+    W: WriteTxn,
 {
     tree: &'t mut BTreeWrite<'a, B, L, W>,
     key: &'k L::Key,
@@ -625,7 +625,7 @@ impl<'a, 't, 'k, B, L, W> OccupiedEntry<'a, 't, 'k, B, L, W>
 where
     B: PageLayout<Value = u64>,
     L: PageLayout<Key = B::Key>,
-    W: RawWrite,
+    W: WriteTxn,
 {
     pub fn key(&self) -> &L::Key {
         self.entry.key()
@@ -652,12 +652,9 @@ where
         }
 
         // Check if we have a page that's a good candidate for rebalancing.
-        #[allow(clippy::collapsible_if)]
-        if page.free_space() > (PAGE_4K * 3 / 4) {
-            if self.tree.balance(self.key)? {
-                // Balancing may have eliminated the top of the tree. Check that now.
-                self.tree.reduce_depth()?;
-            }
+        if page.should_balance() && self.tree.balance(self.key)? {
+            // Balancing may have eliminated the top of the tree. Check that now.
+            self.tree.reduce_depth()?;
         }
         Ok(())
     }
@@ -682,12 +679,9 @@ where
         entry.replace(new_value)?;
 
         let page = entry.to_page();
-        #[allow(clippy::collapsible_if)]
-        if page.free_space() > (PAGE_4K * 3 / 4) {
-            if self.tree.balance(self.key)? {
-                // Balancing may have eliminated the top of the tree. Check that now.
-                self.tree.reduce_depth()?;
-            }
+        if page.should_balance() && self.tree.balance(self.key)? {
+            // Balancing may have eliminated the top of the tree. Check that now.
+            self.tree.reduce_depth()?;
         }
 
         Ok(())
@@ -698,7 +692,7 @@ impl<'a, 't, 'k, B, L, W> OccupiedEntry<'a, 't, 'k, B, L, W>
 where
     B: PageLayout<Value = u64>,
     L: PageLayoutVectored + PageLayout<Key = B::Key>,
-    W: RawWrite,
+    W: WriteTxn,
 {
     pub fn replace_vectored(mut self, new_value: &[&L::Value]) -> Result<(), Error> {
         // Try and replace normally first
@@ -720,12 +714,9 @@ where
         entry.replace_vectored(new_value)?;
 
         let page = entry.to_page();
-        #[allow(clippy::collapsible_if)]
-        if page.free_space() > (PAGE_4K * 3 / 4) {
-            if self.tree.balance(self.key)? {
-                // Balancing may have eliminated the top of the tree. Check that now.
-                self.tree.reduce_depth()?;
-            }
+        if page.should_balance() && self.tree.balance(self.key)? {
+            // Balancing may have eliminated the top of the tree. Check that now.
+            self.tree.reduce_depth()?;
         }
 
         Ok(())
@@ -736,7 +727,7 @@ pub struct VacantEntry<'a, 't, 'k, B, L, W>
 where
     B: PageLayout<Value = u64>,
     L: PageLayout<Key = B::Key>,
-    W: RawWrite,
+    W: WriteTxn,
 {
     tree: &'t mut BTreeWrite<'a, B, L, W>,
     key: &'k L::Key,
@@ -748,7 +739,7 @@ impl<'a, 't, 'k, B, L, W> VacantEntry<'a, 't, 'k, B, L, W>
 where
     B: PageLayout<Value = u64>,
     L: PageLayout<Key = B::Key>,
-    W: RawWrite,
+    W: WriteTxn,
 {
     pub fn key(&self) -> &L::Key {
         self.key
@@ -831,7 +822,7 @@ impl<'a, 't, 'k, B, L, W> VacantEntry<'a, 't, 'k, B, L, W>
 where
     B: PageLayout<Value = u64>,
     L: PageLayoutVectored + PageLayout<Key = B::Key>,
-    W: RawWrite,
+    W: WriteTxn,
 {
     pub fn insert_vectored(
         self,

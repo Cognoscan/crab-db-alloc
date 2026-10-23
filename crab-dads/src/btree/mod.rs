@@ -43,13 +43,13 @@ mod test {
         let (reader, mut writer) = test_alloc::new_db(|page| {
             PageMapMut::<LayoutU64Var>::new(page, 1);
         });
-        let p = writer.allocate_page().unwrap();
+        let p = writer.allocate(1).unwrap();
         let p_num = p.1;
         let (p, _) = p.0.split_at_mut(4);
         p.copy_from_slice(&[5, 6, 7, 8]);
         writer.commit();
         unsafe {
-            let p = reader.load(p_num, 1).unwrap();
+            let p = reader.load(p_num).unwrap();
             let (p, _) = p.split_at(4);
             dbg!(p);
         }

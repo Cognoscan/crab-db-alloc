@@ -4,6 +4,13 @@ use crate::Error;
 
 use super::{PageLayout, PageLayoutVectored, MAX_VAR_SIZE};
 
+/// A Layout storing `u64` keys and variable-length values. Values are always 8
+/// byte aligned.
+/// 
+/// The layout data is the length of the value. The stored values are always 8
+/// byte aligned, which requires rounding the length up to a multiple of 8 when
+/// reporting the value length. This is required in order for the `u64` keys to
+/// be properly aligned.
 #[repr(C)]
 #[derive(Zeroable, Clone, Copy, Default)]
 pub struct LayoutU64Var {

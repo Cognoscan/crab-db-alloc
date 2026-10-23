@@ -18,21 +18,18 @@ use std::{
 use error::FormatError;
 use memmap2::{MmapMut, MmapOptions, MmapRaw};
 
-pub mod int_page;
+pub mod arena;
+pub mod storage2;
 pub mod block;
 pub mod block_owned;
-pub mod pages;
 mod error;
 pub mod storage;
 
 pub use error::AllocError;
 use storage::StorageInner;
 
-/// The maximum allocation size - 1 MiB
-pub const BLOCK_SIZE: usize = 1 << 20;
-
-/// The minimum database size
-pub const MIN_DB_SIZE: usize = 4 << 20;
+/// The maximum allocation size - 2 MiB
+pub const BLOCK_SIZE: usize = 1 << 21;
 
 /// A single page - should always be 4 kiB
 pub const PAGE_SIZE: usize = 1 << 12;
@@ -41,10 +38,13 @@ pub const PAGE_SIZE: usize = 1 << 12;
 pub const CLUSTER_SIZE: usize = 4 * PAGE_SIZE;
 
 /// The size of a root page in the backing file
-pub const ROOT_SIZE: usize = CLUSTER_SIZE;
+pub const ROOT_SIZE: usize = 1 << 16;
 
 /// The size of all root pages in the backing file
 pub const ROOT_MAP_SIZE: usize = ROOT_SIZE * 2;
+
+/// The minimum database size
+pub const MIN_DB_SIZE: usize = BLOCK_SIZE * 2;
 
 /// Struct for pulling memory right off of a memory map
 #[derive(Clone)]
@@ -826,7 +826,6 @@ impl OpenOptions {
     }
 
     pub fn open<P: AsRef<Path>>(&self, path: P) -> Result<AllocTuple, AllocError> {
-        use fs4::fs_std::FileExt;
 
         if (page_size::get() != PAGE_SIZE) && (page_size::get() != CLUSTER_SIZE) {
             return Err(AllocError::Other("System page size is neither 4kiB nor 16kiB."));
@@ -840,7 +839,7 @@ impl OpenOptions {
             .truncate(false)
             .open(path)
             .map_err(AllocError::Open)?;
-        file.try_lock_exclusive().map_err(AllocError::Lock)?;
+        file.try_lock().map_err(AllocError::Lock)?;
 
         // Figure out the file size and resize as needed.
         let file_size = file.metadata().map_err(AllocError::Open)?.len();

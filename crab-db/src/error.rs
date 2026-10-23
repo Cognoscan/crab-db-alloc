@@ -11,7 +11,7 @@ pub enum AllocError {
     DataFormat(#[source] FormatError),
     /// Couldn't lock the backing file
     #[error("Failed to lock the backing file for exclusive use")]
-    Lock(#[source] std::io::Error),
+    Lock(#[source] std::fs::TryLockError),
     /// Couldn't synchronize to the backing file
     #[error("Synchronizing to the backing file failed")]
     Sync(#[source] std::io::Error),

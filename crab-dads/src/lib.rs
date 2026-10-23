@@ -12,6 +12,9 @@ mod trailer;
 
 pub use trailer::*;
 
+/// Maximum page size we're willing to work with.
+const MAX_PAGE_SIZE: usize = 1 << 16;
+
 impl From<StorageError> for Error {
     fn from(value: StorageError) -> Self {
         Self::Storage(value)
@@ -37,6 +40,8 @@ pub enum Error {
     IncorrectOperation,
     /// Database structure entered into an invalid state.
     InvalidState(&'static str),
+    /// Incorrect allocation behavior detected
+    InvalidAllocation,
 }
 
 impl core::error::Error for Error {
@@ -63,14 +68,10 @@ impl core::fmt::Display for Error {
                 f.write_str("attempted to perform a nonsensical operation on the database")
             }
             Self::InvalidState(s) => write!(f, "Invalid database system state: {}", s),
+            Self::InvalidAllocation => write!(f, "Required different allocation than provided"),
         }
     }
 }
-
-/// 4 kiB page. Standard on most architectures, particularly x64, RISC-V, and
-/// non-Apple ARM.
-const PAGE_4K: usize = 1 << 12;
-
 
 pub(crate) struct ByteFormatter<'a>(&'a [u8]);
 

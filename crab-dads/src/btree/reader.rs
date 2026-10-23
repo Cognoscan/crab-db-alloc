@@ -6,11 +6,10 @@ use core::{
 };
 
 use crate::{
-    page::{self, PageIter, PageLayout, PageMap},
-    Error,
+    Error, MAX_PAGE_SIZE, page::{self, PageIter, PageLayout, PageMap},
 };
 
-use crab_dads_traits::RawRead;
+use crab_dads_traits::ReadTxn;
 
 fn trim_leaf<'a, I, R, K, V, Q>(iter: &mut I, range: &R) -> Result<(), Error>
 where
@@ -123,7 +122,7 @@ pub struct BTreeRead<'a, B, L, R>
 where
     B: PageLayout<Value = u64>,
     L: PageLayout<Key = B::Key>,
-    R: RawRead,
+    R: ReadTxn,
 {
     reader: &'a R,
     root: ReadPage<'a, B, L>,
@@ -144,9 +143,12 @@ where
     B: PageLayout<Value = u64>,
     L: PageLayout<Key = B::Key>,
 {
-    pub unsafe fn try_load<R: RawRead>(reader: &'a R, page: u64) -> Result<Self, Error> {
+    pub unsafe fn try_load<R: ReadTxn>(reader: &'a R, page: u64) -> Result<Self, Error> {
         unsafe {
-            let page_ptr = reader.load_page(page)?;
+            let page_ptr = reader.load(page)?;
+            if page_ptr.is_empty() || page_ptr.len() > MAX_PAGE_SIZE {
+                return Err(Error::DataCorruption("Page size out of range"));
+            }
             if (page::page_type(page_ptr) & 1) == 1 {
                 Ok(ReadPage::Leaf(PageMap::from_page(page_ptr)?))
             } else {
@@ -160,7 +162,7 @@ impl<'a, B, L, R> BTreeRead<'a, B, L, R>
 where
     B: PageLayout<Value = u64>,
     L: PageLayout<Key = B::Key>,
-    R: RawRead,
+    R: ReadTxn,
 {
     /// Load in the root page of a tree.
     ///
@@ -456,7 +458,7 @@ pub struct BTreeIter<'a, B, L, R>
 where
     B: PageLayout<Value = u64>,
     L: PageLayout<Key = B::Key>,
-    R: RawRead,
+    R: ReadTxn,
 {
     reader: &'a R,
     state: BTreeIterState<'a, B, L>,
@@ -487,7 +489,7 @@ impl<'a, B, L, R> BTreeIter<'a, B, L, R>
 where
     B: PageLayout<Value = u64> + 'a,
     L: PageLayout<Key = B::Key> + 'a,
-    R: RawRead,
+    R: ReadTxn,
 {
     #[allow(clippy::type_complexity)]
     fn next_internal(&mut self) -> Result<Option<(&'a L::Key, &'a L::Value)>, Error> {
@@ -586,7 +588,7 @@ impl<'a, B, L, R> Iterator for BTreeIter<'a, B, L, R>
 where
     B: PageLayout<Value = u64> + 'a,
     L: PageLayout<Key = B::Key> + 'a,
-    R: RawRead,
+    R: ReadTxn,
 {
     type Item = Result<(&'a L::Key, &'a L::Value), Error>;
 
@@ -599,7 +601,7 @@ impl<'a, B, L, R> DoubleEndedIterator for BTreeIter<'a, B, L, R>
 where
     B: PageLayout<Value = u64> + 'a,
     L: PageLayout<Key = B::Key> + 'a,
-    R: RawRead,
+    R: ReadTxn,
 {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.next_back_internal().transpose()

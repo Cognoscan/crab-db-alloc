@@ -1,21 +1,29 @@
 use core::{cmp::Ordering, marker::PhantomData, slice};
 
+use crab_dads_traits::Region;
+
 use crate::{
-    arrays::{KeyValArray, RevSizedArray}, ByteFormatter, Error, TwoArrayTrailer, PAGE_4K
+    arrays::{KeyValArray, RevSizedArray},
+    page::TRAILER_SIZE,
+    ByteFormatter, Error, TwoArrayTrailer,
 };
 
-use super::{PageLayout, PageMapMut, CONTENT_SIZE};
+use super::{PageLayout, PageMapMut};
 
-#[repr(transparent)]
+/// A single Page Map, providing immutable access to sorted key-value pairs
+/// within a memory region.
+#[repr(C)]
 pub struct PageMap<'a, T: PageLayout> {
-    layout: PhantomData<&'a T>,
     page: *const u8,
+    len: usize,
+    layout: PhantomData<&'a T>,
 }
 
 impl<'a, T: PageLayout> Clone for PageMap<'a, T> {
     fn clone(&self) -> Self {
         Self {
             page: self.page,
+            len: self.len,
             layout: PhantomData,
         }
     }
@@ -23,11 +31,15 @@ impl<'a, T: PageLayout> Clone for PageMap<'a, T> {
 
 impl<'a, T: PageLayout> core::fmt::Debug for PageMap<'a, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // SAFETY: the page trailer and basic integrity was verified when making a PageMap.
         let (lower, upper) = unsafe {
             let lengths = self.page_trailer().lengths_unchecked();
             let upper_bytes = lengths.upper_bytes();
             let lower = slice::from_raw_parts(self.page, lengths.lower_bytes());
-            let upper = slice::from_raw_parts(self.page.add(CONTENT_SIZE-upper_bytes), upper_bytes);
+            let upper = slice::from_raw_parts(
+                self.page.add(self.len - TRAILER_SIZE - upper_bytes),
+                upper_bytes,
+            );
             (lower, upper)
         };
         f.debug_struct(core::any::type_name::<Self>())
@@ -39,20 +51,29 @@ impl<'a, T: PageLayout> core::fmt::Debug for PageMap<'a, T> {
 }
 
 impl<'a, T: PageLayout> PageMap<'a, T> {
-    /// Convert a page into a PageMap
-    pub fn from_page(page: &'a [u8; PAGE_4K]) -> Result<Self, Error> {
+    /// Convert a page into a PageMap.
+    /// 
+    /// Verifies the page has correct physical layout, but does not check that
+    /// the keys are ordered, which requires calling [`PageMap::verify`] after
+    /// this.
+    pub fn from_page(page: &Region) -> Result<Self, Error> {
         let ret = Self {
             page: page.as_ptr(),
+            len: page.len(),
             layout: PhantomData,
         };
         let trailer = ret.page_trailer();
-        trailer.lengths_layout::<T>(CONTENT_SIZE)?;
+        trailer.lengths_layout::<T>(page.len() - TRAILER_SIZE)?;
         Ok(ret)
     }
 
     /// Get the trailer data for this map.
     pub fn page_trailer(&self) -> &'a TwoArrayTrailer {
-        unsafe { &*(self.page.byte_add(CONTENT_SIZE) as *const TwoArrayTrailer) }
+        // SAFETY: constructing this struct required using a `Region`, where the
+        // base pointer is page-aligned, and the length is a multiple of 4kiB.
+        // This is enough to ensure this pointer math will always point to an
+        // aligned trailer.
+        unsafe { &*(self.page.byte_add(self.len - TRAILER_SIZE) as *const TwoArrayTrailer) }
     }
 
     /// Iterate over the data within the map.
@@ -61,7 +82,9 @@ impl<'a, T: PageLayout> PageMap<'a, T> {
             let lengths = self.page_trailer().lengths_unchecked();
             let data = KeyValArray::new(slice::from_raw_parts(self.page, lengths.lower_bytes()));
             let info = RevSizedArray::new(slice::from_raw_parts(
-                self.page.add(CONTENT_SIZE - lengths.upper_bytes()) as *const T,
+                self.page
+                    .add(self.len - TRAILER_SIZE - lengths.upper_bytes())
+                    as *const T,
                 lengths.upper::<T>(),
             ));
             PageIter { info, data }
@@ -87,33 +110,24 @@ impl<'a, T: PageLayout> PageMap<'a, T> {
         Ok(Some(v))
     }
 
-    /// Copy a page's content to a new page.
-    pub fn copy_to<'b>(&self, dst: &'b mut [u8; PAGE_4K]) -> PageMapMut<'b, T> {
-        unsafe {
-            // Copy the lower region
-            let lengths = self.page_trailer().lengths_unchecked();
-            core::ptr::copy_nonoverlapping(self.page, dst.as_mut_ptr(), lengths.lower_bytes());
-
-            // Copy the upper region, including the trailer data
-            let upper_bytes = lengths.upper_bytes() + core::mem::size_of::<TwoArrayTrailer>();
-            let upper_offset = PAGE_4K - upper_bytes;
-            core::ptr::copy_nonoverlapping(
-                self.page.add(upper_offset),
-                dst.as_mut_ptr().add(upper_offset),
-                upper_bytes,
-            );
-
-            PageMapMut {
-                page: dst.as_mut_ptr(),
-                layout: PhantomData,
-            }
-        }
+    fn as_region(&self) -> &Region {
+        // SAFETY: originally constructed with a region, and page/len never
+        // change, so we can always go back to being a region again.
+        unsafe { Region::from_raw_parts(self.page, self.len)}
     }
 
+    /// Copy a page's content to a new page. The new page must be at least as
+    /// large as the current page.
+    pub fn copy_to<'b>(&self, dst: &'b mut Region) -> Result<PageMapMut<'b, T>, Error> {
+        super::copy_page(self.as_region(), dst)?;
+        PageMapMut::from_page(dst)
+    }
+
+    /// Verify the keys are all in order.
     pub fn verify(&self) -> Result<(), Error> {
         let mut last_key = None;
         for res in self.iter() {
-            let (k,_) = res?;
+            let (k, _) = res?;
             if let Some(last_key) = last_key {
                 if last_key >= k {
                     return Err(Error::DataCorruption("Key ordering is incorrect"));

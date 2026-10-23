@@ -4,6 +4,9 @@ use crate::Error;
 
 use super::PageLayout;
 
+/// A Layout storing `u64` keys and values.
+/// 
+/// The layout data is the actual key, and the stored data is just the value.
 #[derive(Zeroable, Clone, Copy, Default)]
 pub struct LayoutU64U64 {
     key: u64,

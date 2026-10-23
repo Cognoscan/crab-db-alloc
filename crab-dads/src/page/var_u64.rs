@@ -4,6 +4,13 @@ use crate::Error;
 
 use super::{PageLayout, MAX_VAR_SIZE};
 
+/// A Layout storing variable-length keys and u64 values. Keys are always 8 byte
+/// aligned.
+/// 
+/// The layout data is the length of the key. The stored keys are always 8 byte
+/// aligned, which requires rounding the length up to a multiple of 8 when
+/// reporting the key length. This is required in order for the `u64` values
+/// to be properly aligned.
 #[repr(C)]
 #[derive(Zeroable, Clone, Copy, Default)]
 pub struct LayoutVarU64 {
@@ -24,7 +31,7 @@ unsafe impl PageLayout for LayoutVarU64 {
     type Value = u64;
 
     fn key_len(&self) -> usize {
-        self.len.div_ceil(8) as usize
+        ((self.len + 7) & !7) as usize
     }
 
     fn value_len(&self) -> usize {
@@ -43,7 +50,7 @@ unsafe impl PageLayout for LayoutVarU64 {
         if key.len() > MAX_VAR_SIZE {
             return Err(Error::WriteTooLarge);
         }
-        Ok(key.len().div_ceil(8))
+        Ok((key.len() + 7) & !7)
     }
 
     fn determine_value_len(_: &Self::Value) -> Result<usize, Error> {
