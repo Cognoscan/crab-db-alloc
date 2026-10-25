@@ -192,7 +192,7 @@ impl<'a> StorageWriter for &'a mut BasicDbWriter {
         }
     }
 
-    fn stats(&self) -> StorageStats {
+    fn stats(self) -> StorageStats {
         let inner = self.inner.read().unwrap();
         let used_pages = inner.used_pages;
         let writes = inner.commit;
@@ -319,7 +319,8 @@ unsafe impl<'a> WriteTxn for BasicDbWrite<'a> {
         // Update the root info of the database
         db.commit += 1;
         db.root_data.clear();
-        db.root_data.copy_from_slice(data);
+        db.root_data.extend_from_slice(data);
+        db.used_pages += write.new_pages;
 
         // See if we can work through any of the "to_free" lists
         let oldest_checkout = db.checkouts.keys().next().copied().unwrap_or(u64::MAX);

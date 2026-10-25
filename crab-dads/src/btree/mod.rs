@@ -9,58 +9,99 @@ pub use writer::*;
 mod test {
 
     use crate::page::{LayoutU64U64, LayoutU64Var, PageMapMut};
-    use crab_dads_traits::*;
+    use crab_dads_traits::{
+        test_alloc::{BasicDbReader, BasicDbWriter},
+        *,
+    };
     use test_alloc::{BasicDbRead, BasicDbWrite};
 
     use super::*;
 
-    fn new_db() -> (BasicDbRead, BasicDbWrite) {
-        test_alloc::new_db(|page| {
-            PageMapMut::<LayoutU64Var>::new(page, 1);
-        })
+    fn new_db() -> (BasicDbReader, BasicDbWriter) {
+        let (reader, mut writer) = test_alloc::new_db();
+        let txn = writer.write();
+        let page = txn.allocate(1).unwrap();
+        PageMapMut::<LayoutU64Var>::new(page.0, 1);
+        let root = page.1;
+        txn.commit(&[root]).unwrap();
+        (reader, writer)
     }
 
-    fn open_tree_mut(
-        writer: &BasicDbWrite,
-    ) -> BTreeWrite<'_, LayoutU64U64, LayoutU64Var, BasicDbWrite> {
-        let root = writer.root();
-        let (tree, new_root) = unsafe { BTreeWrite::load(writer, root).unwrap() };
-        if let Some(new_root) = new_root {
-            writer.update_root(new_root);
+    fn cycle_writer(writer: &mut BasicDbWriter) {
+        let txn = writer.write();
+        let data = txn.root_data().to_vec();
+        txn.commit(&data).unwrap();
+    }
+
+    struct TestWriteTxn<'a> {
+        root: u64,
+        txn: BasicDbWrite<'a>,
+    }
+
+    impl<'a> TestWriteTxn<'a> {
+        fn txn(writer: &'a mut BasicDbWriter) -> Self {
+            let txn = writer.write();
+            let old_root = txn.root_data()[0];
+            // Load the root at least once, then release it back.
+            let (_, root) = unsafe {
+                BTreeWrite::<LayoutU64U64, LayoutU64Var, BasicDbWrite>::load(&txn, old_root)
+                    .unwrap()
+            };
+            let root = root.unwrap();
+            Self { root, txn }
         }
-        tree
+
+        fn load_mut(&mut self) -> BTreeWrite<'_, LayoutU64U64, LayoutU64Var, BasicDbWrite<'_>> {
+            unsafe { BTreeWrite::load(&self.txn, self.root).unwrap().0 }
+        }
+
+        fn load(&self) -> BTreeRead<'_, LayoutU64U64, LayoutU64Var, BasicDbWrite<'_>> {
+            unsafe { BTreeRead::load(&self.txn, self.root).unwrap() }
+        }
+
+        fn commit(self) {
+            self.txn.commit(&[self.root]).unwrap();
+        }
     }
 
-    fn open_tree(
-        reader: &BasicDbRead,
-    ) -> BTreeRead<'_, LayoutU64U64, LayoutU64Var, BasicDbRead> {
-        let root = reader.root();
-        unsafe { BTreeRead::load(reader, root).unwrap() }
+    struct TestReadTxn<'a> {
+        root: u64,
+        txn: BasicDbRead<'a>,
+    }
+
+    impl<'a> TestReadTxn<'a> {
+        fn txn(reader: &'a BasicDbReader) -> Self {
+            let txn = reader.read();
+            let root = txn.root_data()[0];
+            Self { root, txn }
+        }
+
+        fn load(&self) -> BTreeRead<'_, LayoutU64U64, LayoutU64Var, BasicDbRead<'_>> {
+            unsafe { BTreeRead::load(&self.txn, self.root).unwrap() }
+        }
     }
 
     #[test]
     fn debug_allocator() {
-        let (reader, mut writer) = test_alloc::new_db(|page| {
-            PageMapMut::<LayoutU64Var>::new(page, 1);
-        });
-        let p = writer.allocate(1).unwrap();
-        let p_num = p.1;
-        let (p, _) = p.0.split_at_mut(4);
+        let (reader, mut writer) = test_alloc::new_db();
+        let txn = writer.write();
+        let (p, p_num) = txn.allocate(1).unwrap();
+        let (p, _) = p.split_at_mut(4);
         p.copy_from_slice(&[5, 6, 7, 8]);
-        writer.commit();
-        unsafe {
-            let p = reader.load(p_num).unwrap();
-            let (p, _) = p.split_at(4);
-            dbg!(p);
-        }
+        let root = txn.root_data().to_vec();
+        txn.commit(&root).unwrap();
+        let txn = reader.read();
+        let p = unsafe { txn.load(p_num).unwrap() };
+        let (p, _) = p.split_at(4);
+        dbg!(p);
+        assert_eq!(p, &[5, 6, 7, 8]);
     }
 
     #[test]
     fn sequential_insert_forward() {
-        let (reader, mut writer) = test_alloc::new_db(|page| {
-            PageMapMut::<LayoutU64Var>::new(page, 1);
-        });
-        let mut tree = open_tree_mut(&writer);
+        let (reader, mut writer) = new_db();
+        let mut txn = TestWriteTxn::txn(&mut writer);
+        let mut tree = txn.load_mut();
         let i_len = 100000;
 
         // Insertion
@@ -72,12 +113,13 @@ mod test {
                 }
             }
         }
-        writer.commit();
-        println!("Writing complete, {} pages used", writer.page_count());
+        txn.commit();
+        let info = writer.stats();
+        println!("Writing complete, {} pages used", info.used_pages);
 
         // Post-insert check
-        let reader = reader.reload();
-        let tree = open_tree(&reader);
+        let txn = TestReadTxn::txn(&reader);
+        let tree = txn.load();
         for i in 0..i_len {
             let val = tree.get(&i).unwrap().unwrap();
             assert_eq!(val, i.to_le_bytes().as_slice());
@@ -111,7 +153,8 @@ mod test {
         println!("Reading complete");
 
         // Deletion
-        let mut tree = open_tree_mut(&writer);
+        let mut txn = TestWriteTxn::txn(&mut writer);
+        let mut tree = txn.load_mut();
         for i in 0..i_len {
             match tree.entry(&i).unwrap() {
                 Entry::Vacant(_) => panic!("All entries should be occupied"),
@@ -121,15 +164,14 @@ mod test {
                 }
             }
         }
-        writer.commit();
-        let reader = reader.reload();
-        writer.commit();
-        let reader = reader.reload();
-        writer.commit();
-        println!("Deletion complete, {} pages used", writer.page_count());
+        txn.commit();
+        cycle_writer(&mut writer);
+        let info = writer.stats();
+        println!("Deletion complete, {} pages used", info.used_pages);
 
         // Post-delete check
-        let tree = open_tree(&reader);
+        let txn = TestReadTxn::txn(&reader);
+        let tree = txn.load();
         for i in 0..i_len {
             assert!(tree.get(&i).unwrap().is_none());
         }
@@ -138,7 +180,8 @@ mod test {
     #[test]
     fn sequential_insert_rev() {
         let (reader, mut writer) = new_db();
-        let mut tree = open_tree_mut(&writer);
+        let mut txn = TestWriteTxn::txn(&mut writer);
+        let mut tree = txn.load_mut();
         let i_len = 100000;
 
         // Insertion
@@ -150,12 +193,13 @@ mod test {
                 }
             }
         }
-        writer.commit();
-        println!("Writing complete, {} pages used", writer.page_count());
+        txn.commit();
+        let info = writer.stats();
+        println!("Writing complete, {} pages used", info.used_pages);
 
         // Post-insert check
-        let reader = reader.reload();
-        let tree = open_tree(&reader);
+        let txn = TestReadTxn::txn(&reader);
+        let tree = txn.load();
         for i in (0..i_len).rev() {
             let Some(val) = tree.get(&i).expect("no error") else {
                 panic!("expected to get a value for {}", i);
@@ -193,7 +237,8 @@ mod test {
         println!("Reading complete");
 
         // Deletion
-        let mut tree = open_tree_mut(&writer);
+        let mut txn = TestWriteTxn::txn(&mut writer);
+        let mut tree = txn.load_mut();
         for i in (0..i_len).rev() {
             match tree.entry(&i).unwrap() {
                 Entry::Vacant(_) => panic!("All entries should be occupied, but {i} is unoccupied"),
@@ -203,16 +248,14 @@ mod test {
                 }
             }
         }
-        writer.commit();
-        let reader = reader.reload();
-        writer.commit();
-        let reader = reader.reload();
-        writer.commit();
-        println!("Deletion complete, {} pages used", writer.page_count());
+        txn.commit();
+        cycle_writer(&mut writer);
+        let info = writer.stats();
+        println!("Deletion complete, {} pages used", info.used_pages);
 
         // Post-delete check
-        let reader = reader.reload();
-        let tree = open_tree(&reader);
+        let txn = TestReadTxn::txn(&reader);
+        let tree = txn.load();
         for i in (0..i_len).rev() {
             assert!(tree.get(&i).unwrap().is_none());
         }
@@ -221,7 +264,8 @@ mod test {
     #[test]
     fn sequential_var_insert_forward() {
         let (reader, mut writer) = new_db();
-        let mut tree = open_tree_mut(&writer);
+        let mut txn = TestWriteTxn::txn(&mut writer);
+        let mut tree = txn.load_mut();
         let i_len = 100000;
 
         fn idx_to_data(i: u64) -> &'static [u8] {
@@ -239,12 +283,13 @@ mod test {
                 }
             }
         }
-        writer.commit();
-        println!("Writing complete, {} pages used", writer.page_count());
+        txn.commit();
+        let info = writer.stats();
+        println!("Writing complete, {} pages used", info.used_pages);
 
         // Post-insert check
-        let reader = reader.reload();
-        let tree = open_tree(&reader);
+        let txn = TestReadTxn::txn(&reader);
+        let tree = txn.load();
         for i in 0..i_len {
             let val = tree.get(&i).unwrap().unwrap();
             assert_eq!(val, idx_to_data(i));
@@ -278,7 +323,8 @@ mod test {
         println!("Reading complete");
 
         // Deletion
-        let mut tree = open_tree_mut(&writer);
+        let mut txn = TestWriteTxn::txn(&mut writer);
+        let mut tree = txn.load_mut();
         for i in 0..i_len {
             match tree.entry(&i).unwrap() {
                 Entry::Vacant(_) => panic!("All entries should be occupied"),
@@ -288,15 +334,14 @@ mod test {
                 }
             }
         }
-        writer.commit();
-        let reader = reader.reload();
-        writer.commit();
-        let reader = reader.reload();
-        writer.commit();
-        println!("Deletion complete, {} pages used", writer.page_count());
+        txn.commit();
+        cycle_writer(&mut writer);
+        let info = writer.stats();
+        println!("Deletion complete, {} pages used", info.used_pages);
 
         // Post-delete check
-        let tree = open_tree(&reader);
+        let txn = TestReadTxn::txn(&reader);
+        let tree = txn.load();
         for i in 0..i_len {
             assert!(tree.get(&i).unwrap().is_none());
         }
@@ -305,7 +350,8 @@ mod test {
     #[test]
     fn sequential_var_insert_rev() {
         let (reader, mut writer) = new_db();
-        let mut tree = open_tree_mut(&writer);
+        let mut txn = TestWriteTxn::txn(&mut writer);
+        let mut tree = txn.load_mut();
         let i_len = 100000;
 
         // Insertion
@@ -317,12 +363,13 @@ mod test {
                 }
             }
         }
-        writer.commit();
-        println!("Writing complete, {} pages used", writer.page_count());
+        txn.commit();
+        let info = writer.stats();
+        println!("Writing complete, {} pages used", info.used_pages);
 
         // Post-insert check
-        let reader = reader.reload();
-        let tree = open_tree(&reader);
+        let txn = TestReadTxn::txn(&reader);
+        let tree = txn.load();
         for i in (0..i_len).rev() {
             let Some(val) = tree.get(&i).expect("no error") else {
                 panic!("expected to get a value for {}", i);
@@ -360,7 +407,8 @@ mod test {
         println!("Reading complete");
 
         // Deletion
-        let mut tree = open_tree_mut(&writer);
+        let mut txn = TestWriteTxn::txn(&mut writer);
+        let mut tree = txn.load_mut();
         for i in (0..i_len).rev() {
             match tree.entry(&i).unwrap() {
                 Entry::Vacant(_) => panic!("All entries should be occupied, but {i} is unoccupied"),
@@ -370,16 +418,14 @@ mod test {
                 }
             }
         }
-        writer.commit();
-        let reader = reader.reload();
-        writer.commit();
-        let reader = reader.reload();
-        writer.commit();
-        println!("Deletion complete, {} pages used", writer.page_count());
+        txn.commit();
+        cycle_writer(&mut writer);
+        let info = writer.stats();
+        println!("Deletion complete, {} pages used", info.used_pages);
 
         // Post-delete check
-        let reader = reader.reload();
-        let tree = open_tree(&reader);
+        let txn = TestReadTxn::txn(&reader);
+        let tree = txn.load();
         for i in (0..i_len).rev() {
             assert!(tree.get(&i).unwrap().is_none());
         }

@@ -316,7 +316,7 @@ pub trait StorageWriter {
 
     /// Extract database statistics. Can be useful for determining when to
     /// trigger a commit to durable storage.
-    fn stats(&self) -> StorageStats;
+    fn stats(self) -> StorageStats;
 }
 
 /// Statistics on the database, which may be useful for determining when to

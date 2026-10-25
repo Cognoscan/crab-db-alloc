@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use crab_dads_traits::{LoadMut, WriteTxn};
 
 use crate::{
-    page::{self, Balance, PageLayout, PageLayoutVectored, PageMap, PageMapMut},
+    page::{self, Balance, PageLayout, PageLayoutVectored, PageMapMut},
     Error,
 };
 
