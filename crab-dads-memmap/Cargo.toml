@@ -4,3 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+crab-dads = { path = "../crab-dads" }
+crab-dads-traits = { path = "../crab-dads-traits" }
+memmap2 = "0.9"
+thiserror = "2"
+page_size = "0.6"
+byteorder = "1"
+bytemuck = { version = "1", features = ["derive"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
