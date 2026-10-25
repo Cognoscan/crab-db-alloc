@@ -22,8 +22,8 @@ mod test {
         let txn = writer.write();
         let page = txn.allocate(1).unwrap();
         PageMapMut::<LayoutU64Var>::new(page.0, 1);
-        let root = page.1;
-        txn.commit(&[root]).unwrap();
+        let root = page.1.to_le_bytes();
+        txn.commit(&root).unwrap();
         (reader, writer)
     }
 
@@ -41,7 +41,7 @@ mod test {
     impl<'a> TestWriteTxn<'a> {
         fn txn(writer: &'a mut BasicDbWriter) -> Self {
             let txn = writer.write();
-            let old_root = txn.root_data()[0];
+            let old_root: u64 = bytemuck::from_bytes::<u64>(txn.root_data()).to_le();
             // Load the root at least once, then release it back.
             let (_, root) = unsafe {
                 BTreeWrite::<LayoutU64U64, LayoutU64Var, BasicDbWrite>::load(&txn, old_root)
@@ -60,7 +60,8 @@ mod test {
         }
 
         fn commit(self) {
-            self.txn.commit(&[self.root]).unwrap();
+            let root = self.root.to_le_bytes();
+            self.txn.commit(&root).unwrap();
         }
     }
 
@@ -72,7 +73,7 @@ mod test {
     impl<'a> TestReadTxn<'a> {
         fn txn(reader: &'a BasicDbReader) -> Self {
             let txn = reader.read();
-            let root = txn.root_data()[0];
+            let root: u64 = bytemuck::from_bytes::<u64>(txn.root_data()).to_le();
             Self { root, txn }
         }
 

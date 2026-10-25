@@ -1,5 +1,14 @@
 /*!
-Components definining the interface into a transactional storage system.
+Components definining the interface into a transactional storage system, without
+requiring the standard library.
+
+The core entry points into a storage system are:
+
+- [`StorageWriter`] - a write transactor
+- [`StorageReader`] - a read transactor
+- Optional: [`StorageCommitter`] - commit to durable backing storage
+- Optional: [`WriteAllocator`] - allocate writeable regions for future
+  write transactions.
 
 `crab-dads` requires a storage system, which must handle allocating and
 deallocating regions of memory. Memory [`Region`]s are 4 kiB aligned memory that
@@ -18,8 +27,7 @@ and removes their ability to read deallocated regions. A reader can initiate a
 [read transaction][ReadTxn], which captures the state of the storage system at
 its most recent commit, allowing regions to be read without worrying about them
 being deallocated. Transactions always have some data associated with them,
-stored as a slice of [`u64`] values, which can be used to determine where to
-start reading and writing within the storage system.
+stored as a byte slice.
 
 A storage system may also have durable backing storage, like a hard drive.
 Backing storage can be used to persist a storage system, such that its state can
@@ -49,6 +57,7 @@ implements [`ReadTxnAllocation`].
 */
 #![no_std]
 
+/// Pages are 4 kiB in size.
 pub const PAGE_4K: usize = 4096;
 
 mod error;
@@ -151,7 +160,10 @@ pub unsafe trait ReadTxn {
     unsafe fn load(&self, region: u64) -> Result<&Region, StorageError>;
 
     /// Get the root data associated with this read point.
-    fn root_data(&self) -> &[u64];
+    /// 
+    /// Implementors of this trait must ensure the root data always has a
+    /// minimum alignment of 8.
+    fn root_data(&self) -> &[u8];
 
     /// Return how many write transactions have elapsed since opening this transaction.
     fn elapsed(&self) -> u64;
@@ -252,8 +264,12 @@ pub unsafe trait WriteTxn: ReadTxn {
 
     /// Commit this sequence of allocations, loads, and deallocations, making it
     /// visible to [readers][StorageReader] and [committers][StorageCommitter]
-    /// once this function completes. The associated data is also made visible.
-    fn commit(self, data: &[u64]) -> Result<(), StorageError>;
+    /// once this function completes. The associated root data is also made
+    /// visible, retrievable using [`ReadTxn::root_data()`].
+    /// 
+    /// Implementors of this trait must ensure data is stored with a minimum
+    /// alignment of 8.
+    fn commit(self, data: &[u8]) -> Result<(), StorageError>;
 
     /// Return the number of new pages that have been allocated since this
     /// transaction was opened. This includes any added external allocations.
@@ -261,6 +277,10 @@ pub unsafe trait WriteTxn: ReadTxn {
 }
 
 /// A [`WriteTxn`] implementor that also supports adding write allocations.
+/// 
+/// Allocations are almost always obtained by a struct implementing
+/// [`WriteAllocator`]. These can be written to, filled, and then included in a
+/// write transaction using [`WriteTxnAllocation::add_alloc`].
 pub trait WriteTxnAllocation: WriteTxn {
     type WA: WriteAllocation;
 
@@ -269,19 +289,36 @@ pub trait WriteTxnAllocation: WriteTxn {
     ///
     /// Implementors should verify that the allocation and the write transaction
     /// both came from the same storage system.
-    unsafe fn add_alloc(&self, alloc: Self::WA) -> Result<(), StorageError>;
+    fn add_alloc(&self, alloc: Self::WA) -> Result<(), StorageError>;
 }
 
+/// Trait for holding a writable memory region that can be added to a future
+/// write transaction.
+/// 
+/// Write allocations are almost always obtained from a struct that implements
+/// [`WriteAllocator`]. These allocations enable multi-threaded writes; many
+/// allocations can be created and written to independently of a [`WriteTxn`],
+/// but are only committed to the storage system when they are added to a
+/// [`WriteTxn`], which must also implement [`WriteTxnAllocation`].
 pub trait WriteAllocation: DerefMut<Target = Region> {
     /// Get the region ID
     fn region_u64(&self) -> u64;
 }
 
+/// Trait for allocating writeable memory regions ([`WriteAllocation`]s).
+/// 
+/// A write allocator can be cloned, allowing for many write allocators to exist
+/// for the same storage system. In general, write allocators have some
+/// additional overhead on the storage system, so only create many if frequent
+/// write allocations across many threads are expected.
 pub trait WriteAllocator: Clone {
     /// The write allocation type.
     type WA: WriteAllocation;
 
     /// Allocate a new region of memory for eventual use in a write transaction.
+    /// 
+    /// Allocations are always requested in number of 4 kiB pages. They may be
+    /// larger than the requested size, but are never smaller.
     fn allocate(&self, num_pages: usize) -> Result<Self::WA, StorageError>;
 }
 

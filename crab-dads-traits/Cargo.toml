@@ -6,11 +6,12 @@ rust-version = "1.93"
 
 [dependencies]
 bytemuck = { version = "1", features = ["derive"] }
+aligned-vec = { version = "0.6.4", optional = true }
 
 [features]
 default = ["std", "test-alloc"]
 # Include a basic allocator implementation for testing purposes
-test-alloc = ["std"]
+test-alloc = ["std", "dep:aligned-vec"]
 # Support std::io::Error as an encapsulated storage error type
 std = []
 

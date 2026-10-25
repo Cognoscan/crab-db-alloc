@@ -1,21 +1,30 @@
+/*!
+A simple in-memory allocator for testing purposes.
+
+Does not implement [`StorageCommitter`].
+
+ */
 extern crate std;
 use std::{
-    boxed::Box,
     cell::RefCell,
     collections::{btree_map::BTreeMap, vec_deque::VecDeque},
     sync::{Arc, RwLock},
-    vec,
     vec::Vec,
 };
 
+use aligned_vec::{ABox, AVec, ConstAlign};
+
 use super::*;
+
+type PageBox = ABox<[u8], ConstAlign<4096>>;
+type RootData = AVec<u8, ConstAlign<8>>;
 
 #[derive(Clone)]
 struct BasicDbInner {
-    memory: BTreeMap<u64, Box<[u8]>>,
+    memory: BTreeMap<u64, PageBox>,
     checkouts: BTreeMap<u64, u64>,
     commit: u64,
-    root_data: Vec<u64>,
+    root_data: RootData,
     used_pages: u64,
 }
 
@@ -30,7 +39,7 @@ impl<'a> std::fmt::Debug for CheckoutFmt<'a> {
     }
 }
 
-struct MemoryFmt<'a>(&'a BTreeMap<u64, Box<[u8]>>);
+struct MemoryFmt<'a>(&'a BTreeMap<u64, PageBox>);
 impl<'a> std::fmt::Debug for MemoryFmt<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for page in self.0.iter() {
@@ -90,7 +99,7 @@ impl<'a> StorageReader for &'a BasicDbReader {
 pub struct BasicDbRead<'a> {
     inner: &'a BasicDbReader,
     commit: u64,
-    root_data: Vec<u64>,
+    root_data: RootData,
 }
 
 impl<'a> Drop for BasicDbRead<'a> {
@@ -121,7 +130,7 @@ unsafe impl<'a> ReadTxn for BasicDbRead<'a> {
         unsafe { Ok(Region::from_raw_parts(mem.as_ptr(), mem.len())) }
     }
 
-    fn root_data(&self) -> &[u64] {
+    fn root_data(&self) -> &[u8] {
         &self.root_data
     }
 
@@ -131,20 +140,22 @@ unsafe impl<'a> ReadTxn for BasicDbRead<'a> {
     }
 }
 
-fn alloc_paged(pages: usize) -> Box<[u8]> {
+fn alloc_paged(pages: usize) -> PageBox {
     let len = PAGE_4K * pages;
+    let mut data = AVec::with_capacity(4096, len);
+    // Safety: We just created the vec with enough capacity, and raw bytes can
+    // always be considered to be initialized.
     unsafe {
-        // Unsafe ops are to ensure the allocated memory is page-aligned.
-        let ptr = std::alloc::alloc(core::alloc::Layout::from_size_align_unchecked(len, PAGE_4K));
-        Box::from_raw(core::ptr::slice_from_raw_parts_mut(ptr, len))
+        data.set_len(len);
     }
+    data.into_boxed_slice()
 }
 
 /// Construct a new memory-only, simplified database.
 pub fn new_db() -> (BasicDbReader, BasicDbWriter) {
     // Actual interior state of the database
     let memory = BTreeMap::new();
-    let root_data = Vec::new();
+    let root_data = RootData::new(8);
 
     // Construct the interior shared state.
     let inner = Arc::new(RwLock::new(BasicDbInner {
@@ -213,12 +224,12 @@ impl<'a> StorageWriter for &'a mut BasicDbWriter {
 pub struct BasicDbWrite<'a> {
     inner: &'a mut BasicDbWriter,
     cell: RefCell<BasicDbWriteCell>,
-    root_data: Vec<u64>,
+    root_data: RootData,
 }
 
 struct BasicDbWriteCell {
     page_num: u64,
-    dirty: BTreeMap<u64, Box<[u8]>>,
+    dirty: BTreeMap<u64, PageBox>,
     to_drop: Vec<u64>,
     new_pages: u64,
 }
@@ -247,7 +258,7 @@ unsafe impl<'a> ReadTxn for BasicDbWrite<'a> {
         unsafe { Ok(Region::from_raw_parts(mem.as_ptr(), mem.len())) }
     }
 
-    fn root_data(&self) -> &[u64] {
+    fn root_data(&self) -> &[u8] {
         &self.root_data
     }
 
@@ -305,7 +316,7 @@ unsafe impl<'a> WriteTxn for BasicDbWrite<'a> {
     }
 
     /// Commit all outstanding write operations to the database.
-    fn commit(self, data: &[u64]) -> Result<(), StorageError> {
+    fn commit(self, data: &[u8]) -> Result<(), StorageError> {
         // Decompose our transaction into its inner content
         let writer = self.inner;
         let mut db = writer.inner.write().unwrap();
