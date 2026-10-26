@@ -27,7 +27,7 @@ and removes their ability to read deallocated regions. A reader can initiate a
 [read transaction][ReadTxn], which captures the state of the storage system at
 its most recent commit, allowing regions to be read without worrying about them
 being deallocated. Transactions always have some data associated with them,
-stored as a byte slice.
+stored as a byte slice, which can be up to 512 bytes in size.
 
 A storage system may also have durable backing storage, like a hard drive.
 Backing storage can be used to persist a storage system, such that its state can
@@ -268,7 +268,7 @@ pub unsafe trait WriteTxn: ReadTxn {
     /// visible, retrievable using [`ReadTxn::root_data()`].
     /// 
     /// Implementors of this trait must ensure data is stored with a minimum
-    /// alignment of 8.
+    /// alignment of 8, and that the stored data can be up to 512 bytes in size.
     fn commit(self, data: &[u8]) -> Result<(), StorageError>;
 
     /// Return the number of new pages that have been allocated since this
@@ -349,11 +349,11 @@ pub trait StorageWriter {
     type W: WriteTxn;
 
     /// Start a write transaction.
-    fn write(self) -> Self::W;
+    fn write(&mut self) -> Self::W;
 
     /// Extract database statistics. Can be useful for determining when to
     /// trigger a commit to durable storage.
-    fn stats(self) -> StorageStats;
+    fn stats(&self) -> StorageStats;
 }
 
 /// Statistics on the database, which may be useful for determining when to
@@ -390,7 +390,7 @@ pub trait StorageReader: Clone {
     type R: ReadTxn;
 
     /// Start a read transaction.
-    fn read(self) -> Self::R;
+    fn read(&self) -> Self::R;
 }
 
 /// Trait for a storage system struct that supports committing to durable
