@@ -78,10 +78,10 @@ pub struct BasicDbReader {
     inner: Arc<RwLock<BasicDbInner>>,
 }
 
-impl<'a> StorageReader for &'a BasicDbReader {
-    type R = BasicDbRead<'a>;
+impl StorageReader for BasicDbReader {
+    type R<'a> = BasicDbRead<'a>;
 
-    fn read(self) -> Self::R {
+    fn read(&self) -> Self::R<'_> {
         let mut inner = self.inner.write().unwrap();
 
         let commit = inner.commit;
@@ -186,9 +186,9 @@ pub struct BasicDbWriter {
     to_drop: VecDeque<(u64, Vec<u64>)>,
 }
 
-impl<'a> StorageWriter for &'a mut BasicDbWriter {
-    type W = BasicDbWrite<'a>;
-    fn write(self) -> Self::W {
+impl StorageWriter for BasicDbWriter {
+    type W<'a> = BasicDbWrite<'a>;
+    fn write(&mut self) -> Self::W<'_> {
         let root_data = self.inner.read().unwrap().root_data.clone();
         let cell = RefCell::new(BasicDbWriteCell {
             page_num: self.page_num,
@@ -203,7 +203,7 @@ impl<'a> StorageWriter for &'a mut BasicDbWriter {
         }
     }
 
-    fn stats(self) -> StorageStats {
+    fn stats(&self) -> StorageStats {
         let inner = self.inner.read().unwrap();
         let used_pages = inner.used_pages;
         let writes = inner.commit;
@@ -268,9 +268,8 @@ unsafe impl<'a> ReadTxn for BasicDbWrite<'a> {
 }
 
 unsafe impl<'a> WriteTxn for BasicDbWrite<'a> {
-
     fn added_pages(&self) -> u64 {
-        self.cell.borrow().new_pages        
+        self.cell.borrow().new_pages
     }
 
     fn allocate(&self, num_pages: usize) -> Result<(&mut Region, u64), StorageError> {

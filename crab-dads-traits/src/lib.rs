@@ -74,7 +74,6 @@ pub mod test_alloc;
 pub struct Region([u8]);
 
 impl Region {
-
     /// Return the number of 4 kiB pages in this region.
     pub fn num_pages(&self) -> usize {
         self.len() / PAGE_4K
@@ -86,7 +85,10 @@ impl Region {
     /// and also requires that the raw pointer must be 4 kiB aligned, and the
     /// length must be a multiple of 4 kiB.
     pub unsafe fn from_raw_parts<'a>(ptr: *const u8, len: usize) -> &'a Region {
-        debug_assert!(len.is_multiple_of(PAGE_4K), "Must be a multiple of 4 kiB page size");
+        debug_assert!(
+            len.is_multiple_of(PAGE_4K),
+            "Must be a multiple of 4 kiB page size"
+        );
         debug_assert!(
             ptr.align_offset(PAGE_4K) == 0,
             "Region alignment isn't to 4 kiB boundary"
@@ -104,7 +106,10 @@ impl Region {
     /// pointer must be 4 kiB aligned, and the length must be a multiple of 4
     /// kiB.
     pub unsafe fn from_raw_parts_mut<'a>(ptr: *mut u8, len: usize) -> &'a mut Region {
-        debug_assert!(len.is_multiple_of(PAGE_4K), "Must be a multiple of 4 kiB page size");
+        debug_assert!(
+            len.is_multiple_of(PAGE_4K),
+            "Must be a multiple of 4 kiB page size"
+        );
         debug_assert!(
             ptr.align_offset(PAGE_4K) == 0,
             "Region alignment isn't to 4 kiB boundary"
@@ -160,7 +165,7 @@ pub unsafe trait ReadTxn {
     unsafe fn load(&self, region: u64) -> Result<&Region, StorageError>;
 
     /// Get the root data associated with this read point.
-    /// 
+    ///
     /// Implementors of this trait must ensure the root data always has a
     /// minimum alignment of 8.
     fn root_data(&self) -> &[u8];
@@ -266,7 +271,7 @@ pub unsafe trait WriteTxn: ReadTxn {
     /// visible to [readers][StorageReader] and [committers][StorageCommitter]
     /// once this function completes. The associated root data is also made
     /// visible, retrievable using [`ReadTxn::root_data()`].
-    /// 
+    ///
     /// Implementors of this trait must ensure data is stored with a minimum
     /// alignment of 8, and that the stored data can be up to 512 bytes in size.
     fn commit(self, data: &[u8]) -> Result<(), StorageError>;
@@ -277,7 +282,7 @@ pub unsafe trait WriteTxn: ReadTxn {
 }
 
 /// A [`WriteTxn`] implementor that also supports adding write allocations.
-/// 
+///
 /// Allocations are almost always obtained by a struct implementing
 /// [`WriteAllocator`]. These can be written to, filled, and then included in a
 /// write transaction using [`WriteTxnAllocation::add_alloc`].
@@ -294,7 +299,7 @@ pub trait WriteTxnAllocation: WriteTxn {
 
 /// Trait for holding a writable memory region that can be added to a future
 /// write transaction.
-/// 
+///
 /// Write allocations are almost always obtained from a struct that implements
 /// [`WriteAllocator`]. These allocations enable multi-threaded writes; many
 /// allocations can be created and written to independently of a [`WriteTxn`],
@@ -306,7 +311,7 @@ pub trait WriteAllocation: DerefMut<Target = Region> {
 }
 
 /// Trait for allocating writeable memory regions ([`WriteAllocation`]s).
-/// 
+///
 /// A write allocator can be cloned, allowing for many write allocators to exist
 /// for the same storage system. In general, write allocators have some
 /// additional overhead on the storage system, so only create many if frequent
@@ -316,7 +321,7 @@ pub trait WriteAllocator: Clone {
     type WA: WriteAllocation;
 
     /// Allocate a new region of memory for eventual use in a write transaction.
-    /// 
+    ///
     /// Allocations are always requested in number of 4 kiB pages. They may be
     /// larger than the requested size, but are never smaller.
     fn allocate(&self, num_pages: usize) -> Result<Self::WA, StorageError>;
@@ -342,14 +347,16 @@ pub trait ReadTxnAllocation: ReadTxn {
 }
 
 /// Trait for a storage system struct that supports starting write transactions.
-/// 
+///
 /// This is generally implemented on a mutable borrow of a struct.
 pub trait StorageWriter {
     /// The write transaction type.
-    type W: WriteTxn;
+    type W<'a>: WriteTxn
+    where
+        Self: 'a;
 
     /// Start a write transaction.
-    fn write(&mut self) -> Self::W;
+    fn write(&mut self) -> Self::W<'_>;
 
     /// Extract database statistics. Can be useful for determining when to
     /// trigger a commit to durable storage.
@@ -358,7 +365,7 @@ pub trait StorageWriter {
 
 /// Statistics on the database, which may be useful for determining when to
 /// commit to durable storage, or for reporting system overhead.
-/// 
+///
 /// The sum of `free_pages` and `used_pages` should always match `total_pages`.
 /// `uncommitted_pages` and `storage_pages` are always less than `used_pages`.
 #[derive(Clone, Debug)]
@@ -387,10 +394,12 @@ pub struct StorageStats {
 /// Trait for a storage system struct that supports starting read transactions.
 pub trait StorageReader: Clone {
     // The read transaction type.
-    type R: ReadTxn;
+    type R<'a>: ReadTxn
+    where
+        Self: 'a;
 
     /// Start a read transaction.
-    fn read(&self) -> Self::R;
+    fn read(&self) -> Self::R<'_>;
 }
 
 /// Trait for a storage system struct that supports committing to durable

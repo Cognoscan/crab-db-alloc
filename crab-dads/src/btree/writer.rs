@@ -40,7 +40,10 @@ where
 {
     /// Try and load a page from a `WriteTxn` implementor. If the page was clean
     /// and needed to be copied to enable writing to it, the new page number is returned.
-    pub fn try_load<W: WriteTxn>(writer: &'a W, page: u64) -> Result<(Self, Option<u64>), Error> {
+    pub fn try_load<W: WriteTxn>(
+        writer: &'a W,
+        page: u64,
+    ) -> Result<(Self, Option<u64>), Error> {
         unsafe { Self::from_mut_page(writer, writer.load_mut(page)?, page) }
     }
 
@@ -113,7 +116,10 @@ where
     }
 
     /// Turn into a temporary reader
-    pub fn as_read(&mut self) -> BTreeRead<'_, B, L, W> {
+    pub fn as_read<'b>(&'b mut self) -> BTreeRead<'b, B, L, W>
+    where
+        'a: 'b,
+    {
         // Clear out any descent into the tree that we'd previously done
         self.branches.truncate(1);
 
